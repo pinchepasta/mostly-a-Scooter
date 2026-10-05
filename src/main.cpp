@@ -9,8 +9,8 @@
 //               F = forget saved pairing of selected scooter   Q = back
 //        Pair:  Q = cancel
 //        Ride:  R = start/stop recording   I = battery info pages   T = theme   Q = disconnect & home
-//               L = motor lock/unlock   H = tail light off/brake/always   S = settings
-//        Settings: ; / . = select row   , / / = change value   ENT = toggle   (hotkeys: L H A T B)   ESC / DEL / Q = back to HUD
+//               L = motor lock/unlock   H = tail light off/brake/always   G = headlight   V = HUD style   S = settings
+//        Settings: ; / . = select row   , / / = change value   ENT = toggle   (hotkeys: L H G A V T B)   ESC / DEL / Q = back to HUD
 //        ESC (or DEL) always goes back: Settings / Info -> ride HUD, Scan / Export -> home. On the ride HUD, Q disconnects.
 //        Info:  I or / = next page   , = previous page   R = record   Q = back to ride
 //        Export: Q = back
@@ -34,6 +34,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);  // ECDH/mbedtls needs more than the 8 kB d
 #define MI_FILL_RANDOM(b, n) esp_fill_random((b), (n))
 #include "mi_crypto.h"
 #include "battery.h"
+#include "logo.h"
 
 #define APP_NAME "mostly-a-Scooter"
 
@@ -530,10 +531,18 @@ constexpr uint8_t REG_LOCK = 0x70;        // write 0x0001 = lock motor
 constexpr uint8_t REG_UNLOCK = 0x71;      // write 0x0001 = unlock motor
 constexpr uint8_t REG_BRAKE_KERS = 0x7B;  // motor brake / energy recovery: 0 weak, 1 medium, 2 strong
 constexpr uint8_t REG_TAIL = 0x7D;        // TAIL light mode: 0 off, 1 on while braking, 2 always on
+// HEADLIGHT. Unlike the tail light (ESC register 0x7D) the Xiaomi headlight is part of the dashboard
+// assembly and no public protocol document lists a register for it. Fill these in once you know
+// what your scooter accepts (target board, register, on/off words). HEAD_REG = 0 means "not set":
+// the G key / settings row then just says so and nothing is written to the scooter.
+constexpr uint8_t HEAD_ADDR = bat::ADDR_ESC_TX;  // board that owns the headlight register
+constexpr uint8_t HEAD_REG = 0x00;               // register to write (0 = not configured)
+constexpr uint16_t HEAD_ON = 1, HEAD_OFF = 0;    // values for on / off
 const char* BRAKE_NAMES[3] = {"weak", "medium", "strong"};
 const char* TAIL_NAMES[3] = {"off", "brake", "always"};
 
 bool scooterLocked = false;  // last state we commanded (a power-cycled scooter comes back unlocked)
+bool headOn = false;         // last headlight state we commanded
 int tailMode = 1;            // tail light mode (follows what the scooter reports once it answers)
 int brakeLevel = 1;          // motor brake level, saved in prefs
 int alarmMode = 1;           // 0 off, 1 wheel movement, 2 wheel movement + shake (IMU), saved in prefs
@@ -550,9 +559,8 @@ void setNote(const String& s) { ctlNote = s; ctlNoteAt = millis(); }
 void askScooterState(uint32_t inMs = 400) { suppReadAt = millis() + inMs; }
 
 // Write a 16-bit value to an ESC register.
-bool sendWrite16(uint8_t reg, uint16_t val) {
+bool sendWrite16To(uint8_t addr, uint8_t reg, uint16_t val) {
   if (!scooterConnected || !rxChar) { setNote("no link"); return false; }
-  const uint8_t addr = bat::ADDR_ESC_TX;
   uint8_t out[48];
   size_t n;
   if (sessionActive) {
@@ -572,6 +580,8 @@ bool sendWrite16(uint8_t reg, uint16_t val) {
   return true;
 }
 
+bool sendWrite16(uint8_t reg, uint16_t val) { return sendWrite16To(bat::ADDR_ESC_TX, reg, val); }
+
 // Motor lock. Refused while rolling so the scooter can't be locked mid-ride.
 void setLock(bool lock) {
   if (lock && tel.kmh > 1.0f) { setNote("stop first (moving)"); return; }
@@ -590,6 +600,14 @@ void setTail(int mode) {
     tailMode = mode;
     setNote(String("tail light: ") + TAIL_NAMES[mode]);
     askScooterState();
+  }
+}
+
+void setHead(bool on) {
+  if (HEAD_REG == 0) { setNote("headlight: set HEAD_REG"); return; }
+  if (sendWrite16To(HEAD_ADDR, HEAD_REG, on ? HEAD_ON : HEAD_OFF)) {
+    headOn = on;
+    setNote(on ? "headlight ON" : "headlight OFF");
   }
 }
 
@@ -617,6 +635,7 @@ void loadScooterSettings() {
 // Called once after a fresh connect: push the saved brake level, reset local lock/light state.
 void applySavedScooterSettings() {
   scooterLocked = false;
+  headOn = false;
   rdBrake = rdTail = -1;
   alarmUntil = 0;
   delay(150);
@@ -1270,7 +1289,7 @@ void drawScan() {
 // Battery temperature colour: cold (<0) cyan, normal green, warm amber, hot red.
 uint16_t tempColor(int c) { return c < 0 ? C_CYAN : (c <= 45 ? C_FG : (c <= 55 ? C_AMBER : C_RED)); }
 
-void drawRide() {
+void drawRideTerminal() {
   bg();
   const char* st = scooterConnected ? (sessionActive ? "SECURE" : "LINK") : "NO LINK";
   uint16_t sc = scooterConnected ? (sessionActive ? C_FG : C_AMBER) : C_RED;
@@ -1321,25 +1340,361 @@ void drawRide() {
     snprintf(buf, sizeof(buf), "%s REC %lu", blink(400) ? "*" : " ", (unsigned long)samples);
     TR(236, 118, buf, C_RED, 2);
   } else {
-    TR(236, 122, "L H S R I Q", C_DIM, 0);
+    TR(236, 122, "L H G V S R I Q", C_DIM, 0);
   }
   // status badges (lock / lights) + last command result
   if (scooterLocked) T(56, 66, "LOCKED", C_RED, 2);
-  else if (tailMode == 2) T(56, 66, "TAIL", C_AMBER, 2);
+  else {
+    if (headOn) T(56, 66, "HEAD", C_AMBER, 2);
+    if (tailMode == 2) T(100, 66, "TAIL", C_AMBER, 2);
+  }
   drawAlarmBanner();
   cv.pushSprite(0, 0);
 }
 
+// ---- HUD-BEGIN ----------------------------------------------------------------------------
+// ---------------- HUD styles ----------------
+// Four ride HUDs, picked in Settings (or V on the ride screen) and saved. They all use the active
+// colour theme, so style x theme gives 4 x 13 looks.
+//   terminal : the original phosphor-terminal dashboard
+//   cyber    : futuristic segmented gauge with a red-line zone, tech side panel, corner brackets
+//   minimal  : one huge number, a hairline battery bar, everything else out of the way
+//   elegant  : thin ring gauge, serif type, hairline frame and ornaments
+// Set HUD_GFX_FONTS to 0 to fall back to the built-in bitmap fonts instead of the serif ones.
+#ifndef HUD_GFX_FONTS
+#define HUD_GFX_FONTS 1
+#endif
+enum { HUD_TERMINAL, HUD_CYBER, HUD_MINIMAL, HUD_ELEGANT, HUD_COUNT };
+const char* HUD_NAMES[HUD_COUNT] = {"terminal", "cyber", "minimal", "elegant"};
+int hudStyle = HUD_TERMINAL;
+constexpr float HUD_MAX_KMH = 30.0f;  // full scale of the gauges
+
+void loadHud() {
+  prefs.begin("ui", true);
+  hudStyle = constrain((int)prefs.getUChar("hud", HUD_TERMINAL), 0, HUD_COUNT - 1);
+  prefs.end();
+}
+void cycleHud(int dir = 1) {
+  hudStyle = (hudStyle + dir + HUD_COUNT) % HUD_COUNT;
+  prefs.begin("ui", false);
+  prefs.putUChar("hud", hudStyle);
+  prefs.end();
+  setNote(String("hud: ") + HUD_NAMES[hudStyle]);
+}
+
+// Text in whichever font is currently selected. align: 0 left, 1 centre, 2 right. yc = vertical centre.
+void TA(int x, int yc, const String& s, uint16_t col, int align = 0) {
+  cv.setTextSize(1);
+  cv.setTextColor(col);
+  int w = cv.textWidth(s);
+  int x0 = align == 1 ? x - w / 2 : (align == 2 ? x - w : x);
+  cv.setCursor(x0, yc - cv.fontHeight() / 2);
+  cv.print(s);
+}
+void fSerifBig()   { cv.setFont(HUD_GFX_FONTS ? (const lgfx::IFont*)&fonts::FreeSerif24pt7b : (const lgfx::IFont*)&fonts::Font7); }
+void fSerifMid()   { cv.setFont(HUD_GFX_FONTS ? (const lgfx::IFont*)&fonts::FreeSerif12pt7b : (const lgfx::IFont*)&fonts::Font4); }
+void fSerifText()  { cv.setFont(HUD_GFX_FONTS ? (const lgfx::IFont*)&fonts::FreeSerif9pt7b : (const lgfx::IFont*)&fonts::Font2); }
+void fSerifSmall() { cv.setFont(HUD_GFX_FONTS ? (const lgfx::IFont*)&fonts::FreeSerifItalic9pt7b : (const lgfx::IFont*)&fonts::Font2); }
+
+// Filled ring segment. Angles in degrees, 0 = 3 o'clock, increasing clockwise (screen coordinates).
+void polar(int cx, int cy, float r, float a, int& x, int& y) {
+  float t = a * 0.0174533f;
+  x = cx + (int)lroundf(r * cosf(t));
+  y = cy + (int)lroundf(r * sinf(t));
+}
+void arcBand(int cx, int cy, float r0, float r1, float a0, float a1, uint16_t col) {
+  if (a1 <= a0) return;
+  for (float a = a0; a < a1; a += 4.0f) {
+    float b = a + 4.5f;  // slight overlap hides rounding seams
+    if (b > a1) b = a1;
+    int x0, y0, x1, y1, x2, y2, x3, y3;
+    polar(cx, cy, r0, a, x0, y0); polar(cx, cy, r1, a, x1, y1);
+    polar(cx, cy, r1, b, x2, y2); polar(cx, cy, r0, b, x3, y3);
+    cv.fillTriangle(x0, y0, x1, y1, x2, y2, col);
+    cv.fillTriangle(x0, y0, x2, y2, x3, y3, col);
+  }
+}
+void diamond(int x, int y, int r, uint16_t col) {
+  cv.fillTriangle(x - r, y, x, y - r, x + r, y, col);
+  cv.fillTriangle(x - r, y, x, y + r, x + r, y, col);
+}
+void bracket(int x, int y, int dx, int dy, int len, uint16_t col) {  // L-shaped corner mark
+  cv.drawFastHLine(dx > 0 ? x : x - len + 1, y, len, col);
+  cv.drawFastVLine(x, dy > 0 ? y : y - len + 1, len, col);
+}
+
+// Everything the HUDs show, gathered once per frame.
+struct HudData {
+  float kmh;
+  bool conn;
+  const char* st;
+  uint16_t stc;
+  int batt;  // 0..100, -1 unknown
+  uint16_t bc;
+  bool rngOk, rngEst;
+  float rngKm;
+  uint16_t rngc;
+  bool tempOk;
+  int tempC;
+  uint16_t tempc;
+  bool noteOn;
+};
+HudData hudGather() {
+  HudData h;
+  uint32_t now = millis();
+  h.kmh = tel.kmh;
+  h.conn = scooterConnected;
+  h.st = scooterConnected ? (sessionActive ? "SECURE" : "LINK") : "NO LINK";
+  h.stc = scooterConnected ? (sessionActive ? C_FG : C_AMBER) : C_RED;
+  h.batt = tel.batt >= 0 ? constrain(tel.batt, 0, 100) : -1;
+  h.bc = h.batt < 0 ? C_DIM : (h.batt > 50 ? C_FG : (h.batt > 20 ? C_AMBER : C_RED));
+  float estKm, estWk;
+  h.rngOk = h.rngEst = false;
+  h.rngKm = 0;
+  h.rngc = C_DIM;
+  if (bs.rangeFresh(now)) {
+    h.rngOk = true;
+    h.rngKm = bs.rangeKm;
+    h.rngc = bs.rangeKm < 5 ? C_RED : (bs.rangeKm < 10 ? C_AMBER : C_FG);
+  } else if (bs.estimate(tel.rideKm, estKm, estWk)) {
+    h.rngOk = h.rngEst = true;
+    h.rngKm = estKm;
+  }
+  h.tempOk = bs.liveFresh(now);
+  h.tempC = h.tempOk ? bs.live.tmax() : 0;
+  h.tempc = h.tempOk ? tempColor(h.tempC) : C_DIM;
+  h.noteOn = ctlNote.length() && millis() - ctlNoteAt < 2500;
+  return h;
+}
+String fmtRange(const HudData& h) {
+  if (!h.rngOk) return "--";
+  char b[16];
+  snprintf(b, sizeof(b), "%s%.1f", h.rngEst ? "~" : "", h.rngKm);
+  return b;
+}
+String fmtTrip() {
+  char b[16];
+  snprintf(b, sizeof(b), "%.2f", tel.rideKm);
+  return b;
+}
+float speedFrac(float kmh) { return constrain(kmh / HUD_MAX_KMH, 0.0f, 1.0f); }
+
+// ---- cyber: segmented gauge + tech panel ----
+void tag(int x, int y, int w, const char* t, bool on, uint16_t col) {  // small status tag, dim when off
+  if (on) cv.fillRect(x, y, w, 11, col);
+  else cv.drawRect(x, y, w, 11, C_FAINT);
+  cv.setTextFont(0);
+  TA(x + w / 2, y + 6, t, on ? C_BG : C_FAINT, 1);
+}
+void drawHudCyber() {
+  const HudData h = hudGather();
+  bg();
+  const int cx = 76, cy = 70;
+  // gauge: 30 segments over 270 deg, green -> amber -> red zone
+  const int n = 30;
+  int lit = (int)ceilf(speedFrac(h.kmh) * n);
+  for (int i = 0; i < n; i++) {
+    float a0 = 135.0f + i * 9.0f;
+    float f = (i + 1) / (float)n;
+    uint16_t col = f < 0.70f ? C_FG : (f < 0.87f ? C_AMBER : C_RED);
+    arcBand(cx, cy, 53, 60, a0, a0 + 7.4f, i < lit ? col : C_FAINT);
+  }
+  arcBand(cx, cy, 48.5f, 49.5f, 135, 405, C_FAINT);  // inner hairline ring
+  for (int k = 0; k <= 6; k++) {                       // ticks every 5 km/h
+    int x0, y0, x1, y1;
+    float a = 135.0f + 270.0f * k / 6.0f;
+    polar(cx, cy, 62, a, x0, y0);
+    polar(cx, cy, (k == 0 || k == 6) ? 68 : 66, a, x1, y1);
+    cv.drawLine(x0, y0, x1, y1, (k == 0 || k == 6) ? C_DIM : C_FAINT);
+  }
+  // speed
+  int ki = (int)h.kmh;
+  cv.setTextFont(7);
+  String ks = String(ki);
+  int kw = cv.textWidth(ks);
+  TA(cx, cy - 6, ks, h.conn ? C_FG : C_DIM, 1);
+  cv.setTextFont(2);
+  TA(cx + kw / 2 + 2, cy + 12, String(".") + String((int)(h.kmh * 10) % 10), C_DIM, 0);
+  TA(cx, cy + 44, "KM/H", C_DIM, 1);
+
+  // side panel
+  cv.drawFastVLine(144, 12, 100, C_FAINT);
+  cv.fillRect(142, 10, 5, 2, C_DIM);
+  cv.fillRect(142, 112, 5, 2, C_DIM);
+  cv.setTextFont(2);
+  TA(236, 9, h.st, h.stc, 2);
+  if (recording) {
+    char b[20];
+    snprintf(b, sizeof(b), "%s REC %lu", blink(400) ? "*" : " ", (unsigned long)samples);
+    TA(4, 9, b, C_RED, 0);
+  }
+  cv.setTextFont(0);
+  TA(150, 22, "BAT", C_DIM, 0);
+  cv.setTextFont(4);
+  TA(236, 35, h.batt >= 0 ? String(h.batt) + "%" : String("--"), h.bc, 2);
+  int litb = h.batt < 0 ? 0 : (h.batt + 9) / 10;
+  for (int i = 0; i < 10; i++) cv.fillRect(150 + i * 9, 50, 6, 7, i < litb ? h.bc : C_FAINT);
+
+  const int ry[3] = {67, 83, 99};
+  const char* rl[3] = {"RANGE", "TEMP", "TRIP"};
+  String rv[3] = {h.rngOk ? fmtRange(h) + "km" : String("--"), h.tempOk ? String(h.tempC) + "C" : String("--"),
+                  fmtTrip() + "km"};
+  uint16_t rc[3] = {h.rngc, h.tempc, C_FG};
+  for (int i = 0; i < 3; i++) {
+    cv.setTextFont(0);
+    TA(150, ry[i], rl[i], C_DIM, 0);
+    cv.setTextFont(2);
+    TA(236, ry[i], rv[i], rc[i], 2);
+    cv.drawFastHLine(150, ry[i] + 8, 86, C_FAINT);
+  }
+  tag(150, 108, 26, "HEAD", headOn, C_AMBER);
+  tag(180, 108, 26, "TAIL", tailMode == 2, C_AMBER);
+  tag(210, 108, 26, "LOCK", scooterLocked, C_RED);
+
+  // bottom line: command result, else key hints
+  if (h.noteOn) {
+    cv.fillRect(0, 118, 240, 17, C_BG);
+    cv.setTextFont(2);
+    TA(120, 126, ctlNote, C_CYAN, 1);
+  } else {
+    cv.setTextFont(0);
+    TA(8, 127, "L lock H tail G head V hud S set", C_DIM, 0);
+  }
+  bracket(0, 0, 1, 1, 10, C_DIM);   bracket(239, 0, -1, 1, 10, C_DIM);
+  bracket(0, 134, 1, -1, 10, C_DIM); bracket(239, 134, -1, -1, 10, C_DIM);
+  drawAlarmBanner();
+  cv.pushSprite(0, 0);
+}
+
+// ---- minimal: one number ----
+void drawHudMinimal() {
+  const HudData h = hudGather();
+  cv.fillSprite(C_BG);  // no scanlines, whatever the theme says
+  cv.setTextFont(8);
+  TA(120, 50, String((int)lroundf(h.kmh)), h.conn ? C_FG : C_DIM, 1);
+  cv.setTextFont(2);
+  TA(120, 98, "km/h", C_DIM, 1);
+
+  cv.fillCircle(9, 9, 2, h.stc);                                          // link dot
+  if (recording && blink(500)) cv.fillCircle(20, 9, 2, C_RED);            // rec dot
+  cv.setTextFont(0);
+  int xr = 232;  // active flags, right-aligned, only when on
+  auto flag = [&](const char* t, uint16_t c) { TA(xr, 9, t, c, 2); xr -= cv.textWidth(t) + 8; };
+  if (scooterLocked) flag("LOCK", C_RED);
+  if (tailMode == 2) flag("TAIL", C_AMBER);
+  if (headOn) flag("HEAD", C_AMBER);
+
+  cv.setTextFont(2);
+  if (h.noteOn) {
+    TA(120, 114, ctlNote, C_CYAN, 1);
+  } else {
+    TA(8, 114, h.batt >= 0 ? String(h.batt) + "%" : String("--"), C_DIM, 0);
+    TA(120, 114, fmtTrip() + " km", C_DIM, 1);
+    TA(232, 114, h.rngOk ? fmtRange(h) + " km" : String("--"), C_DIM, 2);
+  }
+  cv.fillRect(8, 127, 224, 2, C_FAINT);  // hairline battery bar
+  if (h.batt > 0) cv.fillRect(8, 127, 224 * h.batt / 100, 2, h.bc);
+  drawAlarmBanner();
+  cv.pushSprite(0, 0);
+}
+
+// ---- elegant: ring gauge, serif type ----
+void drawHudElegant() {
+  const HudData h = hudGather();
+  cv.fillSprite(C_BG);
+  cv.drawRoundRect(2, 2, 236, 131, 10, C_DIM);   // double hairline frame
+  cv.drawRoundRect(5, 5, 230, 125, 8, C_FAINT);
+
+  const int cx = 58, cy = 66;
+  const float a1 = 135.0f + 270.0f * speedFrac(h.kmh);
+  arcBand(cx, cy, 43, 44.5f, 135, 405, C_FAINT);  // track
+  for (int k = 0; k <= 6; k++) {                  // dots every 5 km/h
+    int x, y;
+    polar(cx, cy, 50, 135.0f + 270.0f * k / 6.0f, x, y);
+    cv.fillCircle(x, y, (k == 0 || k == 6) ? 2 : 1, C_DIM);
+  }
+  if (h.kmh > 0.2f) {
+    arcBand(cx, cy, 42, 45.5f, 135, a1, C_FG);
+    int x, y;
+    polar(cx, cy, 43.75f, a1, x, y);
+    cv.fillCircle(x, y, 4, C_FG);
+    cv.fillCircle(x, y, 2, C_BG);
+  }
+  fSerifBig();
+  TA(cx, cy - 6, String((int)h.kmh), h.conn ? C_FG : C_DIM, 1);
+  fSerifSmall();
+  TA(cx, cy + 24, "km/h", C_DIM, 1);
+
+  // ornamented divider
+  const int dx = 114, rx0 = 124, rx1 = 230;
+  cv.drawFastVLine(dx, 14, 46, C_FAINT);
+  cv.drawFastVLine(dx, 74, 46, C_FAINT);
+  diamond(dx, 67, 4, C_FG);
+
+  // readouts: battery with a hairline meter, then range / temp / trip
+  fSerifSmall();
+  TA(rx0, 20, "Battery", C_DIM, 0);
+  fSerifText();
+  TA(rx1, 20, h.batt >= 0 ? String(h.batt) + "%" : String("--"), h.bc, 2);
+  cv.fillRoundRect(rx0, 33, rx1 - rx0, 3, 1, C_FAINT);
+  if (h.batt > 0) cv.fillRoundRect(rx0, 33, max(3, (rx1 - rx0) * h.batt / 100), 3, 1, h.bc);
+
+  const int ry[3] = {55, 77, 99};
+  const char* rl[3] = {"Range", "Temp", "Trip"};
+  String rv[3] = {h.rngOk ? fmtRange(h) + "km" : String("--"), h.tempOk ? String(h.tempC) + "C" : String("--"),
+                  fmtTrip() + "km"};
+  uint16_t rc[3] = {h.rngc, h.tempc, C_FG};
+  for (int i = 0; i < 3; i++) {
+    cv.drawFastHLine(rx0, ry[i] - 11, rx1 - rx0, C_FAINT);
+    fSerifSmall();
+    TA(rx0, ry[i], rl[i], C_DIM, 0);
+    fSerifText();
+    TA(rx1, ry[i], rv[i], rc[i], 2);
+  }
+
+  // bottom: link state (left), active flags (right), command result replaces both for a moment
+  fSerifSmall();
+  if (recording && blink(500)) TA(14, 14, "rec", C_RED, 0);
+  if (h.noteOn) {
+    cv.fillRect(10, 110, 220, 16, C_BG);
+    TA(120, 118, ctlNote, C_CYAN, 1);
+  } else {
+    String st = h.st;
+    st.toLowerCase();
+    TA(cx, 118, st, h.stc, 1);
+    String f;
+    if (headOn) f += "head";
+    if (tailMode == 2) f += String(f.length() ? ", " : "") + "tail";
+    if (scooterLocked) f = "locked";
+    if (f.length()) TA(226, 118, f, scooterLocked ? C_RED : C_AMBER, 2);
+  }
+  drawAlarmBanner();
+  cv.pushSprite(0, 0);
+}
+
+void drawRide() {
+  switch (hudStyle) {
+    case HUD_CYBER:   drawHudCyber(); break;
+    case HUD_MINIMAL: drawHudMinimal(); break;
+    case HUD_ELEGANT: drawHudElegant(); break;
+    default:          drawRideTerminal(); break;
+  }
+}
+// ---- HUD-END ------------------------------------------------------------------------------
+
 // Settings: a selectable list. ; / . move the highlight, , and / change the value, ENT toggles.
-enum { SR_LOCK, SR_TAIL, SR_BRAKE, SR_ALARM, SR_THEME, SR_BEEP, SR_COUNT };
+enum { SR_LOCK, SR_TAIL, SR_HEAD, SR_BRAKE, SR_ALARM, SR_HUD, SR_THEME, SR_BEEP, SR_COUNT };
+constexpr int SET_ROWS = 6;  // rows visible at once; the list scrolls
 int setSel = 0;
 
 void settingsAct(int row, int dir) {  // dir: +1 next / toggle, -1 previous
   switch (row) {
     case SR_LOCK:  setLock(!scooterLocked); break;
     case SR_TAIL:  setTail(tailMode + dir); break;
+    case SR_HEAD:  setHead(!headOn); break;
     case SR_BRAKE: setBrake(brakeLevel + dir); break;
     case SR_ALARM: cycleAlarm(dir); break;
+    case SR_HUD:   cycleHud(dir); break;
     case SR_THEME: cycleTheme(dir); break;
     case SR_BEEP:  M5Cardputer.Speaker.tone(3200, 400); break;
   }
@@ -1349,12 +1704,13 @@ void drawSettings() {
   bg();
   header("settings", scooterConnected ? (sessionActive ? "SECURE" : "LINK") : "NO LINK",
          scooterConnected ? C_FG : C_RED);
-  static const char* labels[SR_COUNT] = {"[L] motor lock", "[H] tail light", "    motor brake",
-                                         "[A] alarm", "[T] theme", "[B] beep test"};
-  for (int i = 0; i < SR_COUNT; i++) {
-    int y = 20 + i * 17;
+  static const char* labels[SR_COUNT] = {"[L] motor lock", "[H] tail light", "[G] headlight", "    motor brake",
+                                         "[A] alarm", "[V] hud style", "[T] theme", "[B] beep test"};
+  int top = constrain(setSel - 2, 0, SR_COUNT - SET_ROWS);  // scroll window follows the selection
+  for (int i = top; i < top + SET_ROWS; i++) {
+    int y = 20 + (i - top) * 17;
     bool on = i == setSel;
-    if (on) cv.fillRect(0, y - 1, 240, 17, C_FG);
+    if (on) cv.fillRect(0, y - 1, 237, 17, C_FG);
     uint16_t lc = on ? C_BG : C_FG;
     String val;
     uint16_t vc = C_DIM;
@@ -1362,16 +1718,25 @@ void drawSettings() {
     switch (i) {
       case SR_LOCK:  val = scooterLocked ? "LOCKED" : "off"; vc = scooterLocked ? C_RED : C_DIM; adj = false; break;
       case SR_TAIL:  val = TAIL_NAMES[tailMode]; vc = tailMode == 2 ? C_AMBER : C_DIM; break;
+      case SR_HEAD:
+        val = HEAD_REG == 0 ? "not set" : (headOn ? "ON" : "off");
+        vc = headOn ? C_AMBER : C_DIM;
+        adj = false;
+        break;
       case SR_BRAKE: val = BRAKE_NAMES[brakeLevel]; vc = C_CYAN; break;
       case SR_ALARM: val = ALARM_NAMES[alarmMode]; vc = alarmMode ? C_CYAN : C_DIM; break;
+      case SR_HUD:   val = HUD_NAMES[hudStyle]; vc = C_CYAN; break;
       case SR_THEME: val = THEMES[themeIdx].name; vc = C_CYAN; break;
       case SR_BEEP:  val = "play"; adj = false; break;
     }
     if (on) vc = C_BG;  // readable on the highlight bar
     if (on && adj) val = "< " + val + " >";
     T(4, y, labels[i], lc, 2);
-    TR(236, y, val, vc, 2);
+    TR(234, y, val, vc, 2);
   }
+  // scrollbar
+  cv.fillRect(238, 20, 2, SET_ROWS * 17, C_FAINT);
+  cv.fillRect(238, 20 + top * SET_ROWS * 17 / SR_COUNT, 2, SET_ROWS * SET_ROWS * 17 / SR_COUNT, C_FG);
   drawAlarmBanner();
   if (ctlNote.length() && millis() - ctlNoteAt < 3000) {
     cv.drawFastHLine(0, 124, cv.width(), C_FAINT);
@@ -1603,6 +1968,38 @@ void goHome() {
 }
 
 // ---------------- Arduino ----------------
+// ---- HUD-SPLASH-BEGIN ----
+// Startup splash: logo on black, fades in, holds, fades out. Any key skips it.
+void showSplash() {
+  static uint16_t buf[LOGO_W * LOGO_H];
+  const int x = (cv.width() - LOGO_W) / 2, y = (cv.height() - LOGO_H) / 2;
+  auto frame = [&](int k, int n) {  // k/n brightness
+    for (int i = 0; i < LOGO_W * LOGO_H; i++) {
+      uint16_t c = LOGO_565[i];
+      uint32_t r = ((c >> 11) & 31) * k / n, g = ((c >> 5) & 63) * k / n, b = (c & 31) * k / n;
+      buf[i] = (r << 11) | (g << 5) | b;
+    }
+    cv.fillSprite(0x0000);
+    cv.pushImage(x, y, LOGO_W, LOGO_H, (const lgfx::rgb565_t*)buf);
+    cv.pushSprite(0, 0);
+  };
+  auto wait = [&](uint32_t ms) {  // returns true if a key was pressed
+    uint32_t t0 = millis();
+    while (millis() - t0 < ms) {
+      M5Cardputer.update();
+      if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) return true;
+      delay(10);
+    }
+    return false;
+  };
+  for (int k = 1; k <= 10; k++) { frame(k, 10); delay(40); }
+  bool skip = wait(1500);
+  if (!skip) for (int k = 9; k >= 0; k--) { frame(k, 10); delay(30); }
+  cv.fillSprite(0x0000);
+  cv.pushSprite(0, 0);
+}
+// ---- HUD-SPLASH-END ----
+
 void setup() {
   auto cfg = M5.config();
   Serial.begin(115200);
@@ -1610,7 +2007,9 @@ void setup() {
   M5Cardputer.Display.setRotation(1);
   cv.createSprite(M5Cardputer.Display.width(), M5Cardputer.Display.height());
   loadTheme();
+  loadHud();
   loadScooterSettings();
+  showSplash();
   M5Cardputer.Speaker.setVolume(220);
 
   authQ = xQueueCreate(16, sizeof(Notif));
@@ -1681,6 +2080,8 @@ void loop() {
       else if (k == 't') cycleTheme();
       else if (k == 'l' && !infoPage) setLock(!scooterLocked);
       else if (k == 'h' && !infoPage) setTail(tailMode + 1);
+      else if (k == 'g' && !infoPage) setHead(!headOn);
+      else if (k == 'v' && !infoPage) cycleHud();
       else if (k == 's') { infoPage = 0; setSel = 0; state = ST_SETTINGS; drawSettings(); break; }
       else if (k == 'i') infoPage = (infoPage + 1) % (INFO_PAGES + 1);
       else if (k == '/' && infoPage) infoPage = infoPage % INFO_PAGES + 1;
@@ -1720,7 +2121,9 @@ void loop() {
       else if (k == '/' || k == '\n') settingsAct(setSel, +1);
       else if (k == 'l') { setSel = SR_LOCK;  settingsAct(setSel, +1); }
       else if (k == 'h') { setSel = SR_TAIL;  settingsAct(setSel, +1); }
+      else if (k == 'g') { setSel = SR_HEAD;  settingsAct(setSel, +1); }
       else if (k == 'a') { setSel = SR_ALARM; settingsAct(setSel, +1); }
+      else if (k == 'v') { setSel = SR_HUD;   settingsAct(setSel, +1); }
       else if (k == 't') { setSel = SR_THEME; settingsAct(setSel, +1); }
       else if (k == 'b') { setSel = SR_BEEP;  settingsAct(setSel, +1); }
       else if (k == 'q' || k == KEY_BACK) { state = ST_RIDE; break; }  // back to the main HUD

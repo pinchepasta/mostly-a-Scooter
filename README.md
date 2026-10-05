@@ -22,6 +22,9 @@ saved. Every style follows the colour theme (**T**), so it is 4 styles x 13 them
 The gauges are full-scale at 30 km/h (`HUD_MAX_KMH`). If the serif fonts cause trouble on your
 M5GFX version, build with `-DHUD_GFX_FONTS=0` to use the built-in bitmap fonts instead.
 
+## Startup splash
+The boot sequence opens with the mostly AWESOME. logo on black (fade in, hold, fade out; any key skips it). The logo is baked into `src/logo.h` as RGB565.
+
 ## Lights
 - **H** cycles the **tail light**: off / brake / always (ESC register `0x7D`, documented).
 - **G** toggles the **headlight** (also a row in Settings).
