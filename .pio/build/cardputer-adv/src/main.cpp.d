@@ -402,4 +402,17 @@
  /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/libraries/FS/src/FS.h \
  /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/libraries/SD/src/sd_defines.h \
  /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/libraries/LittleFS/src/LittleFS.h \
- src/mi_crypto.h src/battery.h
+ src/mi_crypto.h \
+ /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/tools/sdk/esp32s3/include/mbedtls/mbedtls/include/mbedtls/ecp.h \
+ /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/tools/sdk/esp32s3/include/mbedtls/port/include/mbedtls/esp_config.h \
+ /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/tools/sdk/esp32s3/include/mbedtls/mbedtls/include/mbedtls/config.h \
+ /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/tools/sdk/esp32s3/include/mbedtls/mbedtls/include/mbedtls/check_config.h \
+ /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/tools/sdk/esp32s3/include/mbedtls/port/include/esp_mem.h \
+ /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/tools/sdk/esp32s3/include/mbedtls/port/include/mbedtls/bignum.h \
+ /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/tools/sdk/esp32s3/include/mbedtls/mbedtls/include/mbedtls/bignum.h \
+ /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/tools/sdk/esp32s3/include/mbedtls/mbedtls/include/mbedtls/ecdh.h \
+ /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/tools/sdk/esp32s3/include/mbedtls/mbedtls/include/mbedtls/md.h \
+ /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/tools/sdk/esp32s3/include/mbedtls/mbedtls/include/mbedtls/platform_util.h \
+ /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/tools/sdk/esp32s3/include/mbedtls/mbedtls/include/mbedtls/ccm.h \
+ /Users/feinlabsfilms/.platformio/packages/framework-arduinoespressif32@3.20014.231204/tools/sdk/esp32s3/include/mbedtls/mbedtls/include/mbedtls/cipher.h \
+ src/battery.h
