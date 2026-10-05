@@ -12,6 +12,7 @@
 //               L = motor lock/unlock   H = tail light off/brake/always   G = headlight   V = HUD style   S = settings
 //        Settings: ; / . = select row   , / / = change value   ENT = toggle   (hotkeys: L H G A V T B)   ESC / DEL / Q = back to HUD
 //        ESC (or DEL) always goes back: Settings / Info -> ride HUD, Scan / Export -> home. On the ride HUD, Q disconnects.
+//        Meters (Ride, key 2): g-force + tilt + speed + battery amps.  2 = open/close   Z = zero tilt   X = tilt axis   C = flip sign   ESC / Q / 1 = back
 //        Info:  I or / = next page   , = previous page   R = record   Q = back to ride
 //        Export: Q = back
 
@@ -1682,6 +1683,175 @@ void drawRide() {
 }
 // ---- HUD-END ------------------------------------------------------------------------------
 
+// ---- STATS-BEGIN --------------------------------------------------------------------------
+// ---------------- Meters page (key 2) ----------------
+// Big, glanceable page: g-force gauge, IMU tilt gauge, live speed and live battery current.
+//   2 = open / close   Z = zero the tilt (and clear the g peak)   X = tilt axis   C = flip tilt sign
+//   ESC / Q / 1 = back to the ride HUD. Follows the colour theme (T) like every other screen.
+// Battery current comes from the BMS (the scooter does not report phase/motor current): + = drawing,
+// - = regen/charging. While this page is open the poll loop alternates motor info and BMS live data.
+bool statPage = false;
+constexpr float STAT_G_SPAN   = 0.5f;    // g-gauge spans 1.0 g +/- this (full deflection)
+constexpr float STAT_TILT_MAX = 30.0f;   // tilt gauge spans +/- this many degrees
+constexpr float STAT_AMP_MIN  = -10.0f;  // current bar: regen end
+constexpr float STAT_AMP_MAX  = 30.0f;   // current bar: full throttle end
+float gSm = 1.0f, gPeakDev = 0;          // smoothed |accel| in g, largest deviation from 1 g since last clear
+float tAx = 0, tAy = 0, tAz = 1;         // smoothed accelerometer vector used for tilt
+int tiltAxis = 0;                        // rotation axis: 0 = X, 1 = Y, 2 = Z (device axes)
+int tiltInv = 0;                         // 1 = flip sign
+float tiltZero = 0;                      // raw angle (deg) that counts as level
+
+void loadStats() {
+  prefs.begin("ui", true);
+  tiltAxis = constrain((int)prefs.getUChar("tAx", 0), 0, 2);
+  tiltInv = prefs.getUChar("tInv", 0) ? 1 : 0;
+  tiltZero = prefs.getFloat("tZero", 0);
+  prefs.end();
+}
+void saveStats() {
+  prefs.begin("ui", false);
+  prefs.putUChar("tAx", tiltAxis);
+  prefs.putUChar("tInv", tiltInv);
+  prefs.putFloat("tZero", tiltZero);
+  prefs.end();
+}
+
+// Called from imuTick() at ~50 Hz with the raw accelerometer reading (g) and its magnitude.
+void statImuUpdate(float ax, float ay, float az, float g) {
+  gSm += 0.3f * (g - gSm);
+  float dev = gSm - 1.0f;
+  if (fabsf(dev) > fabsf(gPeakDev)) gPeakDev = dev;
+  tAx += 0.06f * (ax - tAx);  // ~0.3 s smoothing: rides out bumps without lagging the lean
+  tAy += 0.06f * (ay - tAy);
+  tAz += 0.06f * (az - tAz);
+}
+float tiltRawDeg() {
+  float a;
+  switch (tiltAxis) {
+    case 0:  a = atan2f(tAy, tAz); break;
+    case 1:  a = atan2f(tAx, tAz); break;
+    default: a = atan2f(tAx, tAy); break;
+  }
+  return a * 57.29578f;
+}
+float tiltDeg() {
+  float d = tiltRawDeg() - tiltZero;
+  while (d > 180.0f) d -= 360.0f;
+  while (d < -180.0f) d += 360.0f;
+  return tiltInv ? -d : d;
+}
+void statZero()  { tiltZero = tiltRawDeg(); gPeakDev = 0; saveStats(); setNote("tilt zeroed"); }
+void statAxis()  { tiltAxis = (tiltAxis + 1) % 3; saveStats(); setNote(String("tilt axis ") + "XYZ"[tiltAxis]); }
+void statFlip()  { tiltInv ^= 1; saveStats(); setNote(tiltInv ? "tilt sign: -" : "tilt sign: +"); }
+
+// Centre-zero half-ring gauge. f = -1..+1 (0 = top centre). Fills from the centre towards the value.
+void statGauge(int cx, int cy, float f, uint16_t col, float pk, bool showPk) {
+  const float r0 = 40, r1 = 48;
+  f = constrain(f, -1.0f, 1.0f);
+  arcBand(cx, cy, r0, r1, 180, 360, C_FAINT);                       // track
+  float a = 270.0f + 90.0f * f;
+  if (f > 0.01f) arcBand(cx, cy, r0, r1, 270, a, col);
+  else if (f < -0.01f) arcBand(cx, cy, r0, r1, a, 270, col);
+  for (int k = 0; k <= 4; k++) {                                    // ticks: ends, quarters, centre
+    int x0, y0, x1, y1;
+    float ta = 180.0f + 45.0f * k;
+    polar(cx, cy, r1 + 1, ta, x0, y0);
+    polar(cx, cy, k == 2 ? r1 + 6 : r1 + 4, ta, x1, y1);
+    cv.drawLine(x0, y0, x1, y1, k == 2 ? C_FG : C_DIM);
+  }
+  if (showPk) {                                                      // peak marker
+    int x0, y0, x1, y1;
+    float pa = 270.0f + 90.0f * constrain(pk, -1.0f, 1.0f);
+    polar(cx, cy, r0 - 5, pa, x0, y0);
+    polar(cx, cy, r0 - 1, pa, x1, y1);
+    cv.drawLine(x0, y0, x1, y1, C_AMBER);
+  }
+  int kx, ky;                                                        // knob at the current value
+  polar(cx, cy, (r0 + r1) / 2, a, kx, ky);
+  cv.fillCircle(kx, ky, 6, col);
+  cv.fillCircle(kx, ky, 2, C_BG);
+}
+
+void drawStats() {
+  const uint32_t now = millis();
+  bg();
+  const char* st = scooterConnected ? (sessionActive ? "SECURE" : "LINK") : "NO LINK";
+  uint16_t sc = scooterConnected ? (sessionActive ? C_FG : C_AMBER) : C_RED;
+  header("meters", String(st), sc);
+  if (recording && blink(400)) T(112, 1, "REC", C_RED, 2);
+
+  const int cy = 72, cxL = 60, cxR = 180;
+  char b[24];
+
+  // ---- g-force ----
+  float dev = gSm - 1.0f;
+  float adev = fabsf(dev);
+  uint16_t gc = adev < 0.25f ? C_FG : (adev < 0.5f ? C_AMBER : C_RED);
+  statGauge(cxL, cy, dev / STAT_G_SPAN, gc, gPeakDev / STAT_G_SPAN, fabsf(gPeakDev) > 0.03f);
+  snprintf(b, sizeof(b), "%.2f", gSm);
+  cv.setTextFont(4);
+  TA(cxL, 59, b, gc, 1);
+
+  // ---- tilt ----
+  float tilt = tiltDeg();
+  if (fabsf(tilt) < 0.05f) tilt = 0;
+  float at = fabsf(tilt);
+  uint16_t tc = at < 10.0f ? C_FG : (at < 20.0f ? C_AMBER : C_RED);
+  statGauge(cxR, cy, tilt / STAT_TILT_MAX, tc, 0, false);
+  snprintf(b, sizeof(b), "%.1f", tilt);
+  cv.setTextFont(4);
+  TA(cxR, 59, b, tc, 1);
+
+  // label row (a command result like "tilt zeroed" replaces it for a moment)
+  cv.setTextFont(2);
+  if (ctlNote.length() && now - ctlNoteAt < 2500) {
+    TA(120, 84, ctlNote, C_CYAN, 1);
+  } else {
+    TA(cxL, 84, "G-FORCE (g)", C_DIM, 1);
+    snprintf(b, sizeof(b), "TILT %c%c (deg)", "XYZ"[tiltAxis], tiltInv ? '-' : '+');
+    TA(cxR, 84, b, C_DIM, 1);
+  }
+  cv.drawFastVLine(120, 22, 62, C_FAINT);
+  cv.drawFastHLine(0, 95, cv.width(), C_FAINT);
+  cv.drawFastVLine(120, 96, 38, C_FAINT);
+
+  // ---- speed ----
+  const int vy = 99;
+  snprintf(b, sizeof(b), "%.1f", tel.kmh);
+  uint16_t spc = scooterConnected ? C_FG : C_DIM;
+  cv.setTextFont(4);
+  cv.setTextSize(1);
+  int w = cv.textWidth(b);
+  T(4, vy, b, spc, 4);
+  T(4 + w + 4, vy + 10, "km/h", C_DIM, 2);
+  cv.fillRect(4, 128, 112, 5, C_FAINT);
+  cv.fillRect(4, 128, (int)(112 * speedFrac(tel.kmh)), 5, spc);
+
+  // ---- battery current ----
+  const bool ok = bs.liveFresh(now, 2500);
+  const float amps = ok ? bs.live.amps : 0;
+  uint16_t ac = !ok ? C_DIM : (amps < -0.3f ? C_CYAN : (amps < 15.0f ? C_FG : (amps < 25.0f ? C_AMBER : C_RED)));
+  if (ok) snprintf(b, sizeof(b), "%.1f", amps); else snprintf(b, sizeof(b), "--");
+  cv.setTextFont(4);
+  cv.setTextSize(1);
+  w = cv.textWidth(b);
+  T(126, vy, b, ac, 4);
+  T(126 + w + 4, vy + 10, "A", C_DIM, 2);
+  const int bx = 126, bw = 110;
+  const int zx = bx + (int)(bw * (-STAT_AMP_MIN) / (STAT_AMP_MAX - STAT_AMP_MIN));
+  cv.fillRect(bx, 128, bw, 5, C_FAINT);
+  if (ok) {
+    int vx = bx + (int)(bw * (constrain(amps, STAT_AMP_MIN, STAT_AMP_MAX) - STAT_AMP_MIN) / (STAT_AMP_MAX - STAT_AMP_MIN));
+    if (vx >= zx) cv.fillRect(zx, 128, vx - zx + 1, 5, ac);
+    else cv.fillRect(vx, 128, zx - vx, 5, ac);
+  }
+  cv.drawFastVLine(zx, 126, 9, C_DIM);  // zero marker
+
+  drawAlarmBanner();
+  cv.pushSprite(0, 0);
+}
+// ---- STATS-END ----------------------------------------------------------------------------
+
 // Settings: a selectable list. ; / . move the highlight, , and / change the value, ENT toggles.
 enum { SR_LOCK, SR_TAIL, SR_HEAD, SR_BRAKE, SR_ALARM, SR_HUD, SR_THEME, SR_BEEP, SR_COUNT };
 constexpr int SET_ROWS = 6;  // rows visible at once; the list scrolls
@@ -1925,6 +2095,7 @@ void imuTick() {
   lastAccG = sqrtf(d.accel.x * d.accel.x + d.accel.y * d.accel.y + d.accel.z * d.accel.z);
   shakeEma = 0.9f * shakeEma + 0.1f * fabsf(lastAccG - prevG);  // jitter, used by the lock alarm
   prevG = lastAccG;
+  statImuUpdate(d.accel.x, d.accel.y, d.accel.z, lastAccG);
   if (!recording) return;
   logFile.printf("%lu,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%d", (unsigned long)millis(),
                  d.accel.x, d.accel.y, d.accel.z, d.gyro.x, d.gyro.y, d.gyro.z, tel.kmh, tel.batt);
@@ -1937,10 +2108,15 @@ void imuTick() {
 // Poll schedule (every 150 ms): motor info most of the time, BMS live data every 8th tick,
 // and one "slow" read per 8 ticks cycling through cells / scooter range / pack info / date.
 void pollTick_() {
-  if (!scooterConnected || millis() - lastPoll < 150) return;
+  if (!scooterConnected || millis() - lastPoll < (statPage ? 120u : 150u)) return;
   lastPoll = millis();
   static uint8_t seq = 0, slow = 0;
   seq++;
+  if (statPage) {  // meters page: alternate BMS live data (amps) and motor info (speed), skip the slow reads
+    if (seq & 1) sendRead(bat::ADDR_BMS_TX, bat::REG_LIVE, bat::LEN_LIVE);
+    else sendMotorInfoReq();
+    return;
+  }
   uint8_t slot = seq & 7;
   if (slot == 1) { sendRead(bat::ADDR_BMS_TX, bat::REG_LIVE, bat::LEN_LIVE); return; }
   if (slot == 3) {
@@ -1958,6 +2134,7 @@ void pollTick_() {
 
 void goHome() {
   infoPage = 0;
+  statPage = false;
   if (state == ST_RIDE) {
     stopRecording();
     if (client && scooterConnected) client->disconnect();
@@ -2008,6 +2185,7 @@ void setup() {
   cv.createSprite(M5Cardputer.Display.width(), M5Cardputer.Display.height());
   loadTheme();
   loadHud();
+  loadStats();
   loadScooterSettings();
   showSplash();
   M5Cardputer.Speaker.setVolume(220);
@@ -2065,6 +2243,8 @@ void loop() {
           tel = Telemetry();
           bs = bat::State();
           infoPage = 0;
+          statPage = false;
+          gPeakDev = 0;
           rxMotorN = rxBmsN = rxBmsBad = 0;
           spdCount = 0;
           applySavedScooterSettings();
@@ -2076,19 +2256,29 @@ void loop() {
       break;
 
     case ST_RIDE:
-      if (k == 'r') { recording ? stopRecording() : startRecording(); }
+      if (k == '2') {  // meters page: g-force, tilt, speed, amps
+        statPage = !statPage;
+        infoPage = 0;
+        if (statPage) setNote("9 zero  Z zero  X axis  C flip");
+      }
+      else if (statPage && k == '1') statPage = false;
+      else if (statPage && (k == '9' || k == 'z' || k == 'Z')) statZero();
+      else if (statPage && k == 'x') statAxis();
+      else if (statPage && k == 'c') statFlip();
+      else if (k == 'r') { recording ? stopRecording() : startRecording(); }
       else if (k == 't') cycleTheme();
       else if (k == 'l' && !infoPage) setLock(!scooterLocked);
       else if (k == 'h' && !infoPage) setTail(tailMode + 1);
       else if (k == 'g' && !infoPage) setHead(!headOn);
-      else if (k == 'v' && !infoPage) cycleHud();
-      else if (k == 's') { infoPage = 0; setSel = 0; state = ST_SETTINGS; drawSettings(); break; }
-      else if (k == 'i') infoPage = (infoPage + 1) % (INFO_PAGES + 1);
+      else if (k == 'v' && !infoPage && !statPage) cycleHud();
+      else if (k == 's') { infoPage = 0; statPage = false; setSel = 0; state = ST_SETTINGS; drawSettings(); break; }
+      else if (k == 'i') { statPage = false; infoPage = (infoPage + 1) % (INFO_PAGES + 1); }
       else if (k == '/' && infoPage) infoPage = infoPage % INFO_PAGES + 1;
       else if (k == ',' && infoPage) infoPage = infoPage == 1 ? INFO_PAGES : infoPage - 1;
-      else if (k == KEY_BACK) infoPage = 0;  // ESC: back to the main HUD (never disconnects)
+      else if (k == KEY_BACK) { infoPage = 0; statPage = false; }  // ESC: back to the main HUD (never disconnects)
       else if (k == 'q') {
-        if (infoPage) infoPage = 0;
+        if (statPage) statPage = false;
+        else if (infoPage) infoPage = 0;
         else { goHome(); break; }
       }
       processFrames();
@@ -2111,7 +2301,7 @@ void loop() {
         static uint32_t lastTry = 0;
         if (millis() - lastTry > 4000) { lastTry = millis(); connectScooter(scooterAddr); }
       }
-      if (millis() - lastDraw > 100) { lastDraw = millis(); if (infoPage) drawBattInfo(infoPage); else drawRide(); }
+      if (millis() - lastDraw > 100) { lastDraw = millis(); if (infoPage) drawBattInfo(infoPage); else if (statPage) drawStats(); else drawRide(); }
       break;
 
     case ST_SETTINGS:

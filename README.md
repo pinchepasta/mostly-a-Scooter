@@ -22,6 +22,26 @@ saved. Every style follows the colour theme (**T**), so it is 4 styles x 13 them
 The gauges are full-scale at 30 km/h (`HUD_MAX_KMH`). If the serif fonts cause trouble on your
 M5GFX version, build with `-DHUD_GFX_FONTS=0` to use the built-in bitmap fonts instead.
 
+## Meters page (key 2)
+Press **2** on the ride HUD for a big, glanceable page: a **g-force** gauge (total acceleration from the IMU,
+1.00 g at rest, centre-zero), a **tilt** gauge (degrees, centre-zero, +/-30 deg full scale), the live **speed**
+(km/h) and the live **battery current** (A). It follows the colour theme (**T**) and warns in amber / red as
+values rise. Battery current is signed: positive = drawing power, negative (cyan) = regen. The scooter does
+not report phase/motor current, so this is the BMS (battery-side) current.
+
+| key | action |
+| --- | --- |
+| `2` | open / close the meters page |
+| `Z` | zero the tilt at the current position (and clear the amber g-peak marker); saved |
+| `X` | choose the tilt axis: X / Y / Z of the IMU; saved |
+| `C` | flip the tilt sign; saved |
+| `ESC` / `Q` / `1` | back to the ride HUD (ESC and `1` never disconnect) |
+
+Setup: mount the Cardputer, stand the scooter upright, press **Z**. If the tilt barely moves when you lean
+the scooter forward / back, press **X** until it does; if the direction is the wrong way round, press **C**.
+While the page is open the poll loop alternates motor info and BMS live data (about 4 updates per second each)
+so the numbers stay fresh. Gauge ranges are the `STAT_*` constants above `drawStats()` in `src/main.cpp`.
+
 ## Startup splash
 The boot sequence opens with the mostly AWESOME. logo on black (fade in, hold, fade out; any key skips it). The logo is baked into `src/logo.h` as RGB565.
 
