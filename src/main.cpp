@@ -4,13 +4,14 @@
 // ported from the open-source macbury/m365 reference. Falls back to the
 // plain protocol for old firmware that has no FE95 auth service.
 //
-// Keys:  Home:  S = scan & ride   W = WiFi export   B = BLE export   T = theme (crt / neon / orange)
+// Keys:  Home:  S = scan & ride   W = WiFi export   B = BLE export   T = theme (13 themes, see THEMES[])
 //        Scan:  ; / . = up/down   Enter = connect   A = show all
 //               F = forget saved pairing of selected scooter   Q = back
 //        Pair:  Q = cancel
 //        Ride:  R = start/stop recording   I = battery info pages   T = theme   Q = disconnect & home
 //               L = motor lock/unlock   H = tail light off/brake/always   S = settings
-//        Settings: L = lock   H = tail light   , / . = motor brake weaker/stronger   A = lock-alarm mode   B = beep test   Q = back
+//        Settings: ; / . = select row   , / / = change value   ENT = toggle   (hotkeys: L H A T B)   ESC / DEL / Q = back to HUD
+//        ESC (or DEL) always goes back: Settings / Info -> ride HUD, Scan / Export -> home. On the ride HUD, Q disconnects.
 //        Info:  I or / = next page   , = previous page   R = record   Q = back to ride
 //        Export: Q = back
 
@@ -112,11 +113,14 @@ uint32_t samples = 0, lastFlush = 0, lastImu = 0, lastPoll = 0, lastSpeedT = 0;
 WebServer web(80);
 
 // ---------------- Helpers ----------------
+constexpr char KEY_BACK = 0x1B;  // returned for ESC (top-left key) and DEL/backspace
 char getKey() {
   M5Cardputer.update();
   if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
     auto s = M5Cardputer.Keyboard.keysState();
     if (s.enter) return '\n';
+    if (s.del) return KEY_BACK;
+    for (char c : s.word) if (c == '`' || c == 0x1B) return KEY_BACK;  // ESC key prints '`'
     if (!s.word.empty()) return tolower(s.word.back());
   }
   return 0;
@@ -231,6 +235,27 @@ const Theme THEMES[] = {
     // orange: bright orange + teal accents on black, no scanlines
     {"orange", false, RGB(0, 0, 0), RGB(0, 0, 0), RGB(255, 135, 0), RGB(0, 160, 152), RGB(0, 60, 57),
      RGB(255, 230, 0), RGB(255, 50, 70), RGB(90, 255, 235), RGB(0, 115, 110)},
+    // RED: everything in shades of red (warnings = orange-red, alerts = light red), no scanlines
+    {"RED", false, RGB(10, 0, 0), RGB(22, 0, 0), RGB(255, 30, 30), RGB(150, 0, 0), RGB(65, 0, 0),
+     RGB(255, 95, 40), RGB(255, 150, 150), RGB(210, 50, 70), RGB(115, 0, 0)},
+    // neon-blue: electric cyan-blue + violet on black
+    {"neon-blue", false, RGB(0, 0, 0), RGB(0, 0, 0), RGB(0, 200, 255), RGB(140, 70, 255), RGB(35, 20, 90),
+     RGB(255, 225, 0), RGB(255, 50, 90), RGB(120, 255, 255), RGB(95, 45, 200)},
+    // neon-purple: synthwave violet + cyan on black
+    {"neon-purple", false, RGB(0, 0, 0), RGB(0, 0, 0), RGB(190, 60, 255), RGB(0, 190, 230), RGB(20, 50, 70),
+     RGB(255, 225, 0), RGB(255, 60, 100), RGB(255, 70, 200), RGB(0, 125, 150)},
+    // neon-yellow: volt yellow + orange on black
+    {"neon-yellow", false, RGB(0, 0, 0), RGB(0, 0, 0), RGB(235, 255, 0), RGB(255, 110, 0), RGB(80, 35, 0),
+     RGB(255, 170, 0), RGB(255, 45, 70), RGB(0, 255, 200), RGB(190, 85, 0)},
+    // neon-ice: icy mint + blue on black
+    {"neon-ice", false, RGB(0, 0, 0), RGB(0, 0, 0), RGB(0, 255, 230), RGB(90, 160, 255), RGB(15, 45, 80),
+     RGB(255, 230, 40), RGB(255, 60, 90), RGB(255, 255, 255), RGB(60, 115, 200)},
+    // pink: hot pink on dark plum
+    {"pink", false, RGB(14, 0, 10), RGB(14, 0, 10), RGB(255, 70, 170), RGB(175, 45, 115), RGB(65, 12, 45),
+     RGB(255, 200, 60), RGB(255, 40, 40), RGB(120, 240, 255), RGB(130, 30, 85)},
+    // rosa: soft pastel rose on deep wine
+    {"rosa", false, RGB(24, 6, 14), RGB(24, 6, 14), RGB(255, 170, 200), RGB(190, 110, 140), RGB(75, 35, 52),
+     RGB(255, 215, 130), RGB(255, 90, 100), RGB(170, 230, 255), RGB(140, 80, 105)},
 };
 const int THEME_COUNT = sizeof(THEMES) / sizeof(THEMES[0]);
 
@@ -248,8 +273,8 @@ void loadTheme() {
   prefs.end();
   applyTheme(i);
 }
-void cycleTheme() {
-  applyTheme((themeIdx + 1) % THEME_COUNT);
+void cycleTheme(int dir = 1) {
+  applyTheme((themeIdx + dir + THEME_COUNT) % THEME_COUNT);
   prefs.begin("ui", false);
   prefs.putUChar("theme", themeIdx);
   prefs.end();
@@ -599,8 +624,8 @@ void applySavedScooterSettings() {
   askScooterState(600);
 }
 
-void cycleAlarm() {
-  alarmMode = (alarmMode + 1) % 3;
+void cycleAlarm(int dir = 1) {
+  alarmMode = (alarmMode + dir + 3) % 3;
   alarmUntil = 0;
   prefs.begin("ui", false);
   prefs.putUChar("alarm", alarmMode);
@@ -684,7 +709,7 @@ bool waitNotif(Notif& m, uint8_t src, uint32_t ms) {
       dbgHex(m.src == SRC_UPNP ? "rx UPNP" : "rx AVDTP", m.d, m.len);
       if (src == 0 || m.src == src) return true;
     }
-    if (getKey() == 'q') { cancelled = true; dbgf("cancelled by user"); return false; }
+    { char kk = getKey(); if (kk == 'q' || kk == KEY_BACK) { cancelled = true; dbgf("cancelled by user"); return false; } }
     if (!scooterConnected) { dbgf("link dropped while waiting"); logDrop(); return false; }
     if (cdTotal && millis() - lastDraw > 250) { lastDraw = millis(); drawPairPrompt(); }
   }
@@ -838,7 +863,7 @@ class ClientCb : public NimBLEClientCallbacks {
     for (uint32_t t = millis(); millis() - t < 15000;) {
       char k = getKey();
       if (k == '\n') return true;
-      if (k == 'q') return false;
+      if (k == 'q' || k == KEY_BACK) return false;
       delay(20);
     }
     return false;
@@ -1305,26 +1330,55 @@ void drawRide() {
   cv.pushSprite(0, 0);
 }
 
+// Settings: a selectable list. ; / . move the highlight, , and / change the value, ENT toggles.
+enum { SR_LOCK, SR_TAIL, SR_BRAKE, SR_ALARM, SR_THEME, SR_BEEP, SR_COUNT };
+int setSel = 0;
+
+void settingsAct(int row, int dir) {  // dir: +1 next / toggle, -1 previous
+  switch (row) {
+    case SR_LOCK:  setLock(!scooterLocked); break;
+    case SR_TAIL:  setTail(tailMode + dir); break;
+    case SR_BRAKE: setBrake(brakeLevel + dir); break;
+    case SR_ALARM: cycleAlarm(dir); break;
+    case SR_THEME: cycleTheme(dir); break;
+    case SR_BEEP:  M5Cardputer.Speaker.tone(3200, 400); break;
+  }
+}
+
 void drawSettings() {
   bg();
   header("settings", scooterConnected ? (sessionActive ? "SECURE" : "LINK") : "NO LINK",
          scooterConnected ? C_FG : C_RED);
-  T(6, 24, "[L] motor lock", C_FG, 2);
-  TR(236, 24, scooterLocked ? "LOCKED" : "off", scooterLocked ? C_RED : C_DIM, 2);
-  T(6, 44, "[H] tail light", C_FG, 2);
-  TR(236, 44, TAIL_NAMES[tailMode], tailMode == 2 ? C_AMBER : C_DIM, 2);
-  T(6, 64, "[,/.] motor brake", C_FG, 2);
-  char b[24];
-  snprintf(b, sizeof(b), "%s (%d/2)", BRAKE_NAMES[brakeLevel], brakeLevel);
-  TR(236, 64, b, C_CYAN, 2);
-  segBar(6, 83, 228, 6, (brakeLevel + 1) * 100 / 3, C_CYAN);
-  T(6, 94, "[A] alarm", C_FG, 2);
-  TR(236, 94, ALARM_NAMES[alarmMode], alarmMode ? C_CYAN : C_DIM, 2);
-  String rd = String("scooter: brake ") + (rdBrake >= 0 && rdBrake <= 2 ? BRAKE_NAMES[rdBrake] : "?") +
-              "  tail " + (rdTail >= 0 && rdTail <= 2 ? TAIL_NAMES[rdTail] : "?");
-  T(6, 110, ctlNote.length() && millis() - ctlNoteAt < 3000 ? "> " + ctlNote : rd, C_DIM, 0);
+  static const char* labels[SR_COUNT] = {"[L] motor lock", "[H] tail light", "    motor brake",
+                                         "[A] alarm", "[T] theme", "[B] beep test"};
+  for (int i = 0; i < SR_COUNT; i++) {
+    int y = 20 + i * 17;
+    bool on = i == setSel;
+    if (on) cv.fillRect(0, y - 1, 240, 17, C_FG);
+    uint16_t lc = on ? C_BG : C_FG;
+    String val;
+    uint16_t vc = C_DIM;
+    bool adj = true;  // shows < > arrows
+    switch (i) {
+      case SR_LOCK:  val = scooterLocked ? "LOCKED" : "off"; vc = scooterLocked ? C_RED : C_DIM; adj = false; break;
+      case SR_TAIL:  val = TAIL_NAMES[tailMode]; vc = tailMode == 2 ? C_AMBER : C_DIM; break;
+      case SR_BRAKE: val = BRAKE_NAMES[brakeLevel]; vc = C_CYAN; break;
+      case SR_ALARM: val = ALARM_NAMES[alarmMode]; vc = alarmMode ? C_CYAN : C_DIM; break;
+      case SR_THEME: val = THEMES[themeIdx].name; vc = C_CYAN; break;
+      case SR_BEEP:  val = "play"; adj = false; break;
+    }
+    if (on) vc = C_BG;  // readable on the highlight bar
+    if (on && adj) val = "< " + val + " >";
+    T(4, y, labels[i], lc, 2);
+    TR(236, y, val, vc, 2);
+  }
   drawAlarmBanner();
-  footer("L lock H tail ,/. brake A alarm B test Q back");
+  if (ctlNote.length() && millis() - ctlNoteAt < 3000) {
+    cv.drawFastHLine(0, 124, cv.width(), C_FAINT);
+    T(4, 126, "> " + ctlNote, C_AMBER, 0);
+  } else {
+    footer(";/. select  ,// change  ENT toggle  ESC back");
+  }
   cv.pushSprite(0, 0);
 }
 
@@ -1606,7 +1660,7 @@ void loop() {
       else if (k == 'a') { showAll = !showAll; scanScooters(); }
       else if (k == 's') scanScooters();
       else if (k == 'f' && !devs.empty()) { forgetToken(devs[sel].addr); msg("Pairing forgotten", devs[sel].name, YELLOW); delay(1000); }
-      else if (k == 'q') { goHome(); break; }
+      else if (k == 'q' || k == KEY_BACK) { goHome(); break; }
       else if (k == '\n' && !devs.empty()) {
         if (connectScooter(devs[sel].addr)) {
           tel = Telemetry();
@@ -1627,10 +1681,11 @@ void loop() {
       else if (k == 't') cycleTheme();
       else if (k == 'l' && !infoPage) setLock(!scooterLocked);
       else if (k == 'h' && !infoPage) setTail(tailMode + 1);
-      else if (k == 's') { infoPage = 0; state = ST_SETTINGS; drawSettings(); break; }
+      else if (k == 's') { infoPage = 0; setSel = 0; state = ST_SETTINGS; drawSettings(); break; }
       else if (k == 'i') infoPage = (infoPage + 1) % (INFO_PAGES + 1);
       else if (k == '/' && infoPage) infoPage = infoPage % INFO_PAGES + 1;
       else if (k == ',' && infoPage) infoPage = infoPage == 1 ? INFO_PAGES : infoPage - 1;
+      else if (k == KEY_BACK) infoPage = 0;  // ESC: back to the main HUD (never disconnects)
       else if (k == 'q') {
         if (infoPage) infoPage = 0;
         else { goHome(); break; }
@@ -1659,13 +1714,16 @@ void loop() {
       break;
 
     case ST_SETTINGS:
-      if (k == 'l') setLock(!scooterLocked);
-      else if (k == 'h') setTail(tailMode + 1);
-      else if (k == 'a') cycleAlarm();
-      else if (k == 'b') M5Cardputer.Speaker.tone(3200, 400);
-      else if (k == ',' ) setBrake(brakeLevel - 1);
-      else if (k == '.' ) setBrake(brakeLevel + 1);
-      else if (k == 'q') { state = ST_RIDE; break; }
+      if (k == ';') setSel = (setSel + SR_COUNT - 1) % SR_COUNT;
+      else if (k == '.') setSel = (setSel + 1) % SR_COUNT;
+      else if (k == ',') settingsAct(setSel, -1);
+      else if (k == '/' || k == '\n') settingsAct(setSel, +1);
+      else if (k == 'l') { setSel = SR_LOCK;  settingsAct(setSel, +1); }
+      else if (k == 'h') { setSel = SR_TAIL;  settingsAct(setSel, +1); }
+      else if (k == 'a') { setSel = SR_ALARM; settingsAct(setSel, +1); }
+      else if (k == 't') { setSel = SR_THEME; settingsAct(setSel, +1); }
+      else if (k == 'b') { setSel = SR_BEEP;  settingsAct(setSel, +1); }
+      else if (k == 'q' || k == KEY_BACK) { state = ST_RIDE; break; }  // back to the main HUD
       // keep telemetry flowing so the link and ride stats stay alive while in settings
       processFrames();
       imuTick();
@@ -1679,13 +1737,13 @@ void loop() {
     case ST_EXPORT_WIFI:
       web.handleClient();
       { static uint32_t le = 0; if (millis() - le > 1000) { le = millis(); drawExport(true); } }
-      if (k == 'q') goHome();
+      if (k == 'q' || k == KEY_BACK) goHome();
       break;
 
     case ST_EXPORT_BLE:
       pumpBleExport();
       { static uint32_t le = 0; if (millis() - le > 1000) { le = millis(); drawExport(false); } }
-      if (k == 'q') goHome();
+      if (k == 'q' || k == KEY_BACK) goHome();
       break;
   }
   delay(1);
