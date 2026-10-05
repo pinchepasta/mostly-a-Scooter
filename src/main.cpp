@@ -9,8 +9,8 @@
 //               F = forget saved pairing of selected scooter   Q = back
 //        Pair:  Q = cancel
 //        Ride:  R = start/stop recording   I = battery info pages   T = theme   Q = disconnect & home
-//               L = motor lock/unlock   H = lights on/off   S = settings (motor brake level)
-//        Settings: L = lock   H = lights   , / . = motor brake weaker/stronger   Q = back
+//               L = motor lock/unlock   H = tail light off/brake/always   S = settings
+//        Settings: L = lock   H = tail light   , / . = motor brake weaker/stronger   A = lock-alarm mode   B = beep test   Q = back
 //        Info:  I or / = next page   , = previous page   R = record   Q = back to ride
 //        Export: Q = back
 
@@ -84,6 +84,7 @@ struct Telemetry {
 } tel;
 
 bat::State bs;       // battery (BMS) data + ride statistics
+int rdBrake = -1, rdTail = -1;  // brake level / tail-light mode as REPORTED by the scooter (-1 = unknown)
 int infoPage = 0;    // 0 = ride dashboard, 1..INFO_PAGES = battery info pages
 uint32_t rxMotorN = 0, rxBmsN = 0, rxBmsBad = 0;  // reply counters (diagnostics)
 constexpr int INFO_PAGES = 4;
@@ -442,6 +443,10 @@ void onReply(uint8_t addr, uint8_t reg, const uint8_t* d, size_t n) {
     rxMotorN++;
     if (reg == REG_MOTOR_INFO) onMotorInfo(d, n);
     else if (reg == bat::REG_ESC_RANGE) bs.parseRange(d, n, now);
+    else if (reg == 0x7B && n >= 6) {  // supplementary: brake(u16) cruise(u16) tail light(u16)
+      rdBrake = d[0] | (d[1] << 8);
+      rdTail = d[4] | (d[5] << 8);
+    }
   } else if (addr == bat::ADDR_BMS_RX) {
     rxBmsN++;
     bool ok = false;
@@ -499,16 +504,25 @@ void sendMotorInfoReq() { sendRead(bat::ADDR_ESC_TX, REG_MOTOR_INFO, 0x20); }
 constexpr uint8_t REG_LOCK = 0x70;        // write 0x0001 = lock motor
 constexpr uint8_t REG_UNLOCK = 0x71;      // write 0x0001 = unlock motor
 constexpr uint8_t REG_BRAKE_KERS = 0x7B;  // motor brake / energy recovery: 0 weak, 1 medium, 2 strong
-constexpr uint8_t REG_LIGHT = 0x7D;       // 0x0002 = lights on, 0x0000 = off
+constexpr uint8_t REG_TAIL = 0x7D;        // TAIL light mode: 0 off, 1 on while braking, 2 always on
 const char* BRAKE_NAMES[3] = {"weak", "medium", "strong"};
+const char* TAIL_NAMES[3] = {"off", "brake", "always"};
 
 bool scooterLocked = false;  // last state we commanded (a power-cycled scooter comes back unlocked)
-bool lightsOn = false;       // last state we commanded
+int tailMode = 1;            // tail light mode (follows what the scooter reports once it answers)
 int brakeLevel = 1;          // motor brake level, saved in prefs
+int alarmMode = 1;           // 0 off, 1 wheel movement, 2 wheel movement + shake (IMU), saved in prefs
 String ctlNote;              // one-line result of the last command, shown on screen
 uint32_t ctlNoteAt = 0;
+uint32_t suppReadAt = 0;     // when to ask the scooter for its brake / tail-light state (0 = not scheduled)
+uint32_t lockedAt = 0, alarmUntil = 0, lastBeepAt = 0;
+float shakeEma = 0, prevG = 1.0f;
+constexpr float ALARM_KMH = 0.5f;     // wheel speed that counts as "moved" while locked
+constexpr float ALARM_SHAKE = 0.06f;  // IMU jitter (g) that counts as "moved" in shake mode - tune if needed
+const char* ALARM_NAMES[3] = {"off", "wheel", "wheel+shake"};
 
 void setNote(const String& s) { ctlNote = s; ctlNoteAt = millis(); }
+void askScooterState(uint32_t inMs = 400) { suppReadAt = millis() + inMs; }
 
 // Write a 16-bit value to an ESC register.
 bool sendWrite16(uint8_t reg, uint16_t val) {
@@ -538,14 +552,19 @@ void setLock(bool lock) {
   if (lock && tel.kmh > 1.0f) { setNote("stop first (moving)"); return; }
   if (sendWrite16(lock ? REG_LOCK : REG_UNLOCK, 1)) {
     scooterLocked = lock;
+    lockedAt = millis();
+    alarmUntil = 0;
+    shakeEma = 0;
     setNote(lock ? "motor LOCKED" : "motor unlocked");
   }
 }
 
-void setLights(bool on) {
-  if (sendWrite16(REG_LIGHT, on ? 2 : 0)) {
-    lightsOn = on;
-    setNote(on ? "lights ON" : "lights OFF");
+void setTail(int mode) {
+  mode = ((mode % 3) + 3) % 3;
+  if (sendWrite16(REG_TAIL, mode)) {
+    tailMode = mode;
+    setNote(String("tail light: ") + TAIL_NAMES[mode]);
+    askScooterState();
   }
 }
 
@@ -554,6 +573,7 @@ void setBrake(int level, bool save = true) {
   if (sendWrite16(REG_BRAKE_KERS, level)) {
     brakeLevel = level;
     setNote(String("brake: ") + BRAKE_NAMES[level]);
+    askScooterState();
     if (save) {
       prefs.begin("ui", false);
       prefs.putUChar("brake", brakeLevel);
@@ -565,15 +585,58 @@ void setBrake(int level, bool save = true) {
 void loadScooterSettings() {
   prefs.begin("ui", true);
   brakeLevel = constrain((int)prefs.getUChar("brake", 1), 0, 2);
+  alarmMode = constrain((int)prefs.getUChar("alarm", 1), 0, 2);
   prefs.end();
 }
 
 // Called once after a fresh connect: push the saved brake level, reset local lock/light state.
 void applySavedScooterSettings() {
   scooterLocked = false;
-  lightsOn = false;
+  rdBrake = rdTail = -1;
+  alarmUntil = 0;
   delay(150);
   setBrake(brakeLevel, false);
+  askScooterState(600);
+}
+
+void cycleAlarm() {
+  alarmMode = (alarmMode + 1) % 3;
+  alarmUntil = 0;
+  prefs.begin("ui", false);
+  prefs.putUChar("alarm", alarmMode);
+  prefs.end();
+  setNote(String("alarm: ") + ALARM_NAMES[alarmMode]);
+}
+
+// Ask the scooter for brake / tail-light state when due, so the screen shows the real values.
+void suppTick() {
+  if (suppReadAt && (int32_t)(millis() - suppReadAt) >= 0) {
+    suppReadAt = 0;
+    sendRead(bat::ADDR_ESC_TX, REG_BRAKE_KERS, 6);
+  }
+  if (rdTail >= 0 && rdTail <= 2) tailMode = rdTail;  // trust the scooter
+}
+
+// Locked + moved => loud two-tone beep (and on-screen banner) for 4 s after the last movement.
+void alarmTick() {
+  if (!scooterLocked || alarmMode == 0 || !scooterConnected) { alarmUntil = 0; return; }
+  if (millis() - lockedAt < 2500) return;  // let the lock settle / hand off the scooter
+  bool moved = tel.kmh >= ALARM_KMH || (alarmMode == 2 && shakeEma > ALARM_SHAKE);
+  if (moved) alarmUntil = millis() + 4000;
+  if (millis() < alarmUntil && millis() - lastBeepAt > 330) {
+    lastBeepAt = millis();
+    static bool hi = false;
+    hi = !hi;
+    M5Cardputer.Speaker.tone(hi ? 3200 : 2300, 280);
+  }
+}
+bool alarmActive() { return millis() < alarmUntil; }
+void drawAlarmBanner() {
+  if (!alarmActive()) return;
+  bool on = blink(200);
+  cv.fillRect(0, 19, cv.width(), 42, on ? C_RED : C_BG);
+  cv.drawRect(0, 19, cv.width(), 42, C_RED);
+  T(20, 30, "! MOVED WHILE LOCKED !", on ? C_BG : C_RED, 2);
 }
 
 // ---------------- Pairing UI ----------------
@@ -1237,7 +1300,8 @@ void drawRide() {
   }
   // status badges (lock / lights) + last command result
   if (scooterLocked) T(56, 66, "LOCKED", C_RED, 2);
-  else if (lightsOn) T(56, 66, "LIGHT", C_AMBER, 2);
+  else if (tailMode == 2) T(56, 66, "TAIL", C_AMBER, 2);
+  drawAlarmBanner();
   cv.pushSprite(0, 0);
 }
 
@@ -1247,15 +1311,20 @@ void drawSettings() {
          scooterConnected ? C_FG : C_RED);
   T(6, 24, "[L] motor lock", C_FG, 2);
   TR(236, 24, scooterLocked ? "LOCKED" : "off", scooterLocked ? C_RED : C_DIM, 2);
-  T(6, 44, "[H] lights", C_FG, 2);
-  TR(236, 44, lightsOn ? "ON" : "off", lightsOn ? C_AMBER : C_DIM, 2);
-  T(6, 64, "[</>] motor brake", C_FG, 2);
+  T(6, 44, "[H] tail light", C_FG, 2);
+  TR(236, 44, TAIL_NAMES[tailMode], tailMode == 2 ? C_AMBER : C_DIM, 2);
+  T(6, 64, "[,/.] motor brake", C_FG, 2);
   char b[24];
   snprintf(b, sizeof(b), "%s (%d/2)", BRAKE_NAMES[brakeLevel], brakeLevel);
   TR(236, 64, b, C_CYAN, 2);
-  segBar(6, 86, 228, 8, (brakeLevel + 1) * 100 / 3, C_CYAN);
-  if (ctlNote.length() && millis() - ctlNoteAt < 3000) T(6, 102, "> " + ctlNote, C_AMBER, 2);
-  footer("L lock  H lights  , / . brake  Q back");
+  segBar(6, 83, 228, 6, (brakeLevel + 1) * 100 / 3, C_CYAN);
+  T(6, 94, "[A] alarm", C_FG, 2);
+  TR(236, 94, ALARM_NAMES[alarmMode], alarmMode ? C_CYAN : C_DIM, 2);
+  String rd = String("scooter: brake ") + (rdBrake >= 0 && rdBrake <= 2 ? BRAKE_NAMES[rdBrake] : "?") +
+              "  tail " + (rdTail >= 0 && rdTail <= 2 ? TAIL_NAMES[rdTail] : "?");
+  T(6, 110, ctlNote.length() && millis() - ctlNoteAt < 3000 ? "> " + ctlNote : rd, C_DIM, 0);
+  drawAlarmBanner();
+  footer("L lock H tail ,/. brake A alarm B test Q back");
   cv.pushSprite(0, 0);
 }
 
@@ -1435,6 +1504,8 @@ void imuTick() {
   if (!M5.Imu.update()) return;
   auto d = M5.Imu.getImuData();
   lastAccG = sqrtf(d.accel.x * d.accel.x + d.accel.y * d.accel.y + d.accel.z * d.accel.z);
+  shakeEma = 0.9f * shakeEma + 0.1f * fabsf(lastAccG - prevG);  // jitter, used by the lock alarm
+  prevG = lastAccG;
   if (!recording) return;
   logFile.printf("%lu,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%d", (unsigned long)millis(),
                  d.accel.x, d.accel.y, d.accel.z, d.gyro.x, d.gyro.y, d.gyro.z, tel.kmh, tel.batt);
@@ -1486,6 +1557,7 @@ void setup() {
   cv.createSprite(M5Cardputer.Display.width(), M5Cardputer.Display.height());
   loadTheme();
   loadScooterSettings();
+  M5Cardputer.Speaker.setVolume(220);
 
   authQ = xQueueCreate(16, sizeof(Notif));
   frameQ = xQueueCreate(8, sizeof(Notif));
@@ -1554,7 +1626,7 @@ void loop() {
       if (k == 'r') { recording ? stopRecording() : startRecording(); }
       else if (k == 't') cycleTheme();
       else if (k == 'l' && !infoPage) setLock(!scooterLocked);
-      else if (k == 'h' && !infoPage) setLights(!lightsOn);
+      else if (k == 'h' && !infoPage) setTail(tailMode + 1);
       else if (k == 's') { infoPage = 0; state = ST_SETTINGS; drawSettings(); break; }
       else if (k == 'i') infoPage = (infoPage + 1) % (INFO_PAGES + 1);
       else if (k == '/' && infoPage) infoPage = infoPage % INFO_PAGES + 1;
@@ -1566,6 +1638,8 @@ void loop() {
       processFrames();
       imuTick();
       pollTick_();
+      suppTick();
+      alarmTick();
       {
         static uint32_t lastHist = 0;
         if (millis() - lastHist > 250) {
@@ -1586,7 +1660,9 @@ void loop() {
 
     case ST_SETTINGS:
       if (k == 'l') setLock(!scooterLocked);
-      else if (k == 'h') setLights(!lightsOn);
+      else if (k == 'h') setTail(tailMode + 1);
+      else if (k == 'a') cycleAlarm();
+      else if (k == 'b') M5Cardputer.Speaker.tone(3200, 400);
       else if (k == ',' ) setBrake(brakeLevel - 1);
       else if (k == '.' ) setBrake(brakeLevel + 1);
       else if (k == 'q') { state = ST_RIDE; break; }
@@ -1594,6 +1670,9 @@ void loop() {
       processFrames();
       imuTick();
       pollTick_();
+      { static uint32_t ls = 0; if (millis() - ls > 3000) { ls = millis(); askScooterState(0); } }
+      suppTick();
+      alarmTick();
       if (millis() - lastDraw > 100) { lastDraw = millis(); drawSettings(); }
       break;
 
