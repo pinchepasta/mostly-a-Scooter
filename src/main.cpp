@@ -4,11 +4,12 @@
 // ported from the open-source macbury/m365 reference. Falls back to the
 // plain protocol for old firmware that has no FE95 auth service.
 //
-// Keys:  Home:  S = scan & ride   W = WiFi export   B = BLE export
+// Keys:  Home:  S = scan & ride   W = WiFi export   B = BLE export   T = theme (crt / neon / orange)
 //        Scan:  ; / . = up/down   Enter = connect   A = show all
 //               F = forget saved pairing of selected scooter   Q = back
 //        Pair:  Q = cancel
-//        Ride:  R = start/stop recording   Q = disconnect & home
+//        Ride:  R = start/stop recording   I = battery info pages   T = theme   Q = disconnect & home
+//        Info:  I or / = next page   , = previous page   R = record   Q = back to ride
 //        Export: Q = back
 
 #include <M5Cardputer.h>
@@ -29,6 +30,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);  // ECDH/mbedtls needs more than the 8 kB d
 
 #define MI_FILL_RANDOM(b, n) esp_fill_random((b), (n))
 #include "mi_crypto.h"
+#include "battery.h"
 
 #define APP_NAME "mostly-a-Scooter"
 
@@ -78,6 +80,11 @@ struct Telemetry {
   float rideKm = 0;
   uint32_t lastRx = 0;
 } tel;
+
+bat::State bs;       // battery (BMS) data + ride statistics
+int infoPage = 0;    // 0 = ride dashboard, 1..INFO_PAGES = battery info pages
+uint32_t rxMotorN = 0, rxBmsN = 0, rxBmsBad = 0;  // reply counters (diagnostics)
+constexpr int INFO_PAGES = 4;
 
 NimBLEClient* client = nullptr;
 NimBLERemoteCharacteristic *rxChar = nullptr, *txChar = nullptr, *upnp = nullptr, *avdtp = nullptr;
@@ -137,17 +144,113 @@ void dbgHex(const char* label, const uint8_t* d, size_t n) {
   dbgLines[7][43] = 0;
 }
 
+
+// ---- GAP event tap: records WHY and WHEN the scooter link drops (shown on error screens) ----
+volatile int gapDiscReason = 0;          // NimBLE return code of the last disconnect (0 = none)
+volatile uint32_t gapConnAt = 0, gapDiscAt = 0;
+volatile uint8_t gapEvN = 0;
+volatile char gapEv[12];                 // C=connect M=mtu U/u=conn-param req/done E=encryption P=passkey R=re-pair D=disconnect
+
+int gapTap(ble_gap_event* ev, void*) {
+  char c = 0;
+  switch (ev->type) {
+    case BLE_GAP_EVENT_CONNECT:
+      if (ev->connect.status != 0) break;
+      gapConnAt = millis(); gapDiscAt = 0; gapDiscReason = 0; gapEvN = 0; c = 'C';
+      break;
+    case BLE_GAP_EVENT_DISCONNECT: gapDiscReason = ev->disconnect.reason; gapDiscAt = millis(); c = 'D'; break;
+    case BLE_GAP_EVENT_CONN_UPDATE: c = 'u'; break;
+    case BLE_GAP_EVENT_CONN_UPDATE_REQ: c = 'U'; break;
+    case BLE_GAP_EVENT_L2CAP_UPDATE_REQ: c = 'L'; break;
+    case BLE_GAP_EVENT_ENC_CHANGE: c = 'E'; break;
+    case BLE_GAP_EVENT_PASSKEY_ACTION: c = 'P'; break;
+    case BLE_GAP_EVENT_REPEAT_PAIRING: c = 'R'; break;
+    case BLE_GAP_EVENT_MTU: c = 'M'; break;
+    default: break;
+  }
+  if (c && gapEvN < sizeof(gapEv) - 1) { gapEv[gapEvN] = c; gapEvN = gapEvN + 1; }
+  return 0;
+}
+
+const char* hciName(int c) {
+  switch (c) {
+    case 0x05: return "auth failure";
+    case 0x06: return "key missing";
+    case 0x08: return "link timeout";
+    case 0x13: return "scooter hung up";
+    case 0x14: return "scooter low res";
+    case 0x15: return "scooter power off";
+    case 0x16: return "we hung up";
+    case 0x1A: return "unsupported";
+    case 0x22: return "LL timeout";
+    case 0x28: return "instant passed";
+    case 0x3B: return "bad conn params";
+    case 0x3D: return "MIC failure";
+    case 0x3E: return "connect not est.";
+    default: return "";
+  }
+}
+
+// Call when a link is found dead (or a connect failed): puts the reason + timing on the debug log.
+void logDrop() {
+  delay(30);  // let the BLE host task publish the disconnect event
+  if (client && client->isConnected()) { dbgf("link still up"); return; }
+  int r = gapDiscReason;
+  if (r >= 0x200 && r < 0x300) dbgf("drop hci 0x%02x %s", r - 0x200, hciName(r - 0x200));
+  else if (r) dbgf("drop rc=%d", r);
+  else dbgf("no disconnect event seen");
+  char ev[14] = {0};
+  for (int i = 0; i < gapEvN && i < 12; i++) ev[i] = gapEv[i];
+  if (gapDiscAt && gapConnAt) dbgf("t+%lums ev %s", (unsigned long)(gapDiscAt - gapConnAt), ev);
+  else dbgf("ev %s", ev);
+}
+
 // ---------------- Terminal theme ----------------
 #define RGB(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
-const uint16_t C_BG = RGB(0, 6, 0);
-const uint16_t C_SCAN = RGB(0, 15, 0);
-const uint16_t C_FG = RGB(57, 255, 20);   // phosphor green
-const uint16_t C_DIM = RGB(0, 135, 40);
-const uint16_t C_FAINT = RGB(0, 55, 18);
-const uint16_t C_AMBER = RGB(255, 176, 0);
-const uint16_t C_RED = RGB(255, 60, 60);
-const uint16_t C_CYAN = RGB(0, 225, 205);
-const uint16_t C_LOG = RGB(0, 95, 28);
+// Active palette (set by applyTheme). Roles: FG = primary, DIM = labels/secondary,
+// FAINT = grid/empty bars, AMBER = warning, RED = alert, CYAN = accent (charging/regen/cold/min).
+uint16_t C_BG, C_SCAN, C_FG, C_DIM, C_FAINT, C_AMBER, C_RED, C_CYAN, C_LOG;
+bool scanlines = true;
+int themeIdx = 0;
+
+struct Theme {
+  const char* name;
+  bool scan;
+  uint16_t bg, scanc, fg, dim, faint, amber, red, cyan, log;
+};
+const Theme THEMES[] = {
+    // crt: original phosphor green with CRT scanlines
+    {"crt", true, RGB(0, 6, 0), RGB(0, 15, 0), RGB(57, 255, 20), RGB(0, 135, 40), RGB(0, 55, 18),
+     RGB(255, 176, 0), RGB(255, 60, 60), RGB(0, 225, 205), RGB(0, 95, 28)},
+    // neon: high-contrast neon green + hot pink on black, no scanlines
+    {"neon", false, RGB(0, 0, 0), RGB(0, 0, 0), RGB(57, 255, 20), RGB(255, 40, 170), RGB(90, 15, 60),
+     RGB(255, 235, 0), RGB(255, 70, 10), RGB(0, 240, 255), RGB(190, 30, 125)},
+    // orange: bright orange + teal accents on black, no scanlines
+    {"orange", false, RGB(0, 0, 0), RGB(0, 0, 0), RGB(255, 135, 0), RGB(0, 160, 152), RGB(0, 60, 57),
+     RGB(255, 230, 0), RGB(255, 50, 70), RGB(90, 255, 235), RGB(0, 115, 110)},
+};
+const int THEME_COUNT = sizeof(THEMES) / sizeof(THEMES[0]);
+
+void applyTheme(int i) {
+  if (i < 0 || i >= THEME_COUNT) i = 0;
+  const Theme& t = THEMES[i];
+  themeIdx = i;
+  scanlines = t.scan;
+  C_BG = t.bg; C_SCAN = t.scanc; C_FG = t.fg; C_DIM = t.dim; C_FAINT = t.faint;
+  C_AMBER = t.amber; C_RED = t.red; C_CYAN = t.cyan; C_LOG = t.log;
+}
+void loadTheme() {
+  prefs.begin("ui", true);
+  int i = prefs.getUChar("theme", 0);
+  prefs.end();
+  applyTheme(i);
+}
+void cycleTheme() {
+  applyTheme((themeIdx + 1) % THEME_COUNT);
+  prefs.begin("ui", false);
+  prefs.putUChar("theme", themeIdx);
+  prefs.end();
+}
 
 float spdHist[110];  // speed scope history
 int spdCount = 0;
@@ -169,7 +272,7 @@ void TR(int xr, int y, const String& s, uint16_t col, int font = 2) {
 }
 void bg() {
   cv.fillSprite(C_BG);
-  for (int y = 0; y < cv.height(); y += 3) cv.drawFastHLine(0, y, cv.width(), C_SCAN);  // CRT scanlines
+  if (scanlines) for (int y = 0; y < cv.height(); y += 3) cv.drawFastHLine(0, y, cv.width(), C_SCAN);  // CRT scanlines
 }
 void header(const String& title, const String& right = "", uint16_t rcol = C_DIM, uint16_t tcol = C_FG) {
   T(4, 1, "# " + title, tcol, 2);
@@ -246,7 +349,7 @@ void startRecording() {
   logName = nextRideName();
   logFile = fsys->open(logName, FILE_WRITE);
   if (!logFile) return;
-  logFile.println("ms,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,kmh,batt_pct");
+  logFile.println("ms,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,kmh,batt_pct,pack_v,pack_a,bat_t1,bat_t2");
   samples = 0;
   recording = true;
 }
@@ -324,6 +427,29 @@ void onMotorInfo(const uint8_t* d, size_t dl) {
   tel.kmh = v;
   uint32_t totalM = d[14] | (d[15] << 8) | (d[16] << 16) | ((uint32_t)d[17] << 24);
   tel.totalKm = totalM / 1000.0f;
+  if (dl >= 24) {  // frame / controller temperature, 0.1 deg C
+    float t = (int16_t)(d[22] | (d[23] << 8)) / 10.0f;
+    if (t > -40 && t < 150) bs.escTemp = t;
+  }
+}
+
+// Route a decoded reply [addr, reg, data...] to the right parser.
+void onReply(uint8_t addr, uint8_t reg, const uint8_t* d, size_t n) {
+  uint32_t now = millis();
+  if (addr == bat::ADDR_ESC_RX) {
+    rxMotorN++;
+    if (reg == REG_MOTOR_INFO) onMotorInfo(d, n);
+    else if (reg == bat::REG_ESC_RANGE) bs.parseRange(d, n, now);
+  } else if (addr == bat::ADDR_BMS_RX) {
+    rxBmsN++;
+    bool ok = false;
+    if (reg == bat::REG_LIVE) ok = bs.parseLive(d, n, now, tel.rideKm);
+    else if (reg == bat::REG_CELLS) ok = bs.parseCells(d, n, now);
+    else if (reg == bat::REG_INFO) ok = bs.parseInfo(d, n);
+    else if (reg == bat::REG_DATE) ok = bs.parseDate(d, n);
+    else return;
+    if (!ok) { rxBmsBad++; dbgf("bms reg %02x rejected n=%u", reg, (unsigned)n); }
+  }
 }
 
 void processFrames() {
@@ -333,26 +459,27 @@ void processFrames() {
       uint8_t dec[80];
       int n = mi::decrypt_uart(keys.dev, m.d, m.len, dec);
       // dec = [addr, cmd, reg, data..., rand4]
-      if (n >= 7 && dec[0] == 0x23 && dec[2] == REG_MOTOR_INFO) onMotorInfo(dec + 3, n - 7);
+      if (n >= 7) onReply(dec[0], dec[2], dec + 3, n - 7);
     } else {
       uint16_t s = 0;
       for (size_t i = 2; i < (size_t)m.len - 2; i++) s += m.d[i];
       s ^= 0xFFFF;
       if (s != (uint16_t)(m.d[m.len - 2] | (m.d[m.len - 1] << 8))) continue;
-      if (m.d[3] == 0x23 && m.d[5] == REG_MOTOR_INFO) onMotorInfo(m.d + 6, m.d[2] - 2);
+      if (m.len >= 8 && m.d[2] >= 2) onReply(m.d[3], m.d[5], m.d + 6, m.d[2] - 2);
     }
   }
 }
 
-void sendMotorInfoReq() {
+// Read `len` bytes starting at register `reg` of device `addr` (0x20 = ESC, 0x22 = BMS).
+void sendRead(uint8_t addr, uint8_t reg, uint8_t len) {
   if (!scooterConnected || !rxChar) return;
   uint8_t out[48];
   size_t n;
   if (sessionActive) {
-    const uint8_t req[5] = {3, 0x20, 0x01, REG_MOTOR_INFO, 0x20};
+    const uint8_t req[5] = {3, addr, 0x01, reg, len};
     n = mi::encrypt_uart(keys.app, req, 5, 0, nullptr, out);
   } else {
-    uint8_t f[9] = {0x55, 0xAA, 0x03, 0x20, 0x01, REG_MOTOR_INFO, 0x20, 0, 0};
+    uint8_t f[9] = {0x55, 0xAA, 0x03, addr, 0x01, reg, len, 0, 0};
     uint16_t s = 0;
     for (int i = 2; i < 7; i++) s += f[i];
     s ^= 0xFFFF;
@@ -362,6 +489,8 @@ void sendMotorInfoReq() {
   }
   for (size_t o = 0; o < n; o += 20) rxChar->writeValue(out + o, min((size_t)20, n - o), false);
 }
+
+void sendMotorInfoReq() { sendRead(bat::ADDR_ESC_TX, REG_MOTOR_INFO, 0x20); }
 
 // ---------------- Pairing UI ----------------
 const char* pairStatus = "";
@@ -409,7 +538,7 @@ bool waitNotif(Notif& m, uint8_t src, uint32_t ms) {
       if (src == 0 || m.src == src) return true;
     }
     if (getKey() == 'q') { cancelled = true; dbgf("cancelled by user"); return false; }
-    if (!scooterConnected) { dbgf("link dropped while waiting"); return false; }
+    if (!scooterConnected) { dbgf("link dropped while waiting"); logDrop(); return false; }
     if (cdTotal && millis() - lastDraw > 250) { lastDraw = millis(); drawPairPrompt(); }
   }
   dbgf("timeout %lus (src %d)", (unsigned long)(ms / 1000), src);
@@ -614,10 +743,10 @@ bool linkUp(const NimBLEAddress& a) {
   client->setClientCallbacks(&clientCb, false);
   client->setConnectTimeout(10);
   dbgf("connecting %s", a.toString().c_str());
-  if (!client->connect(a)) { dbgf("GATT connect failed"); return false; }
+  if (!client->connect(a)) { dbgf("GATT connect failed"); logDrop(); return false; }
   scooterConnected = true;
   if (BLE_BONDING) client->secureConnection();
-  delay(200);
+  delay(50);
 
   NimBLERemoteService *uart = nullptr, *auth = nullptr;
   auto* svcs = client->getServices(true);
@@ -631,35 +760,51 @@ bool linkUp(const NimBLEAddress& a) {
   dbgf("svc %s", list.c_str());
   if (!uart) { dbgf("no UART service"); return false; }
 
-  String cl;
-  for (auto* c : *uart->getCharacteristics(true)) {
-    std::string id = normUuid(c->getUUID());
-    cl += id.substr(0, 8).c_str();
-    cl += c->canNotify() ? "n" : "";
-    cl += (c->canWrite() || c->canWriteNoResponse()) ? "w" : "";
-    cl += " ";
-    if (id == "6e400002-b5a3-f393-e0a9-e50e24dcca9e") rxChar = c;
-    else if (id == "6e400003-b5a3-f393-e0a9-e50e24dcca9e") txChar = c;
+  // Xiaomi auth service first: get to the notification subscriptions as fast as possible after
+  // connecting (the scooter may hang up on a central that dawdles).
+  cryptoMode = auth != nullptr;
+  if (auth) {
+    upnp = findChar16(auth, UUID_UPNP);
+    avdtp = findChar16(auth, UUID_AVDTP);
+    if (!upnp || !avdtp) { dbgf("UPNP/AVDTP chars missing"); logDrop(); return false; }
+    if (!avdtp->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) { pushQ(authQ, SRC_AVDTP, d, n); })) { dbgf("subscribe AVDTP failed"); logDrop(); return false; }
+    if (!upnp->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) { pushQ(authQ, SRC_UPNP, d, n); })) { dbgf("subscribe UPNP failed"); logDrop(); return false; }
+    dbgf("auth subscribed t+%lums", (unsigned long)(millis() - gapConnAt));
   }
-  dbgf("uart %s", cl.c_str());
-  if (!rxChar || !txChar) {  // fallback: pick by properties
+
+  // Discovery can come back empty right after connect. Retry, then fall back
+  // to by-UUID lookup, and log whether the link is still alive.
+  for (int attempt = 0; attempt < 3 && !(rxChar && txChar); attempt++) {
+    if (!client->isConnected()) { logDrop(); return false; }
+    if (attempt) delay(500);
+    rxChar = txChar = nullptr;
+    String cl;
     for (auto* c : *uart->getCharacteristics(true)) {
+      std::string id = normUuid(c->getUUID());
+      cl += id.substr(0, 8).c_str();
+      cl += c->canNotify() ? "n" : "";
+      cl += (c->canWrite() || c->canWriteNoResponse()) ? "w" : "";
+      cl += " ";
+      if (id == "6e400002-b5a3-f393-e0a9-e50e24dcca9e") rxChar = c;
+      else if (id == "6e400003-b5a3-f393-e0a9-e50e24dcca9e") txChar = c;
+    }
+    dbgf("uart[%d] %s", attempt, cl.c_str());
+  }
+  if (!rxChar || !txChar) {  // by-UUID discovery
+    rxChar = uart->getCharacteristic(NUS_RX_WRITE);
+    txChar = uart->getCharacteristic(NUS_TX_NOTIFY);
+    dbgf("by-uuid rx=%d tx=%d", rxChar != nullptr, txChar != nullptr);
+  }
+  if (!rxChar || !txChar) {  // fallback: pick by properties
+    for (auto* c : *uart->getCharacteristics(false)) {
       if (!rxChar && c != txChar && (c->canWriteNoResponse() || c->canWrite())) rxChar = c;
       if (!txChar && c != rxChar && c->canNotify()) txChar = c;
     }
     if (rxChar && txChar) dbgf("uart chars picked by props");
   }
-  if (!rxChar || !txChar) { dbgf("UART chars missing"); return false; }
+  if (!rxChar || !txChar) { dbgf("UART chars missing"); logDrop(); return false; }
 
-  cryptoMode = auth != nullptr;
-  if (auth) {
-    upnp = findChar16(auth, UUID_UPNP);
-    avdtp = findChar16(auth, UUID_AVDTP);
-    if (!upnp || !avdtp) { dbgf("UPNP/AVDTP chars missing"); return false; }
-    if (!avdtp->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) { pushQ(authQ, SRC_AVDTP, d, n); })) { dbgf("subscribe AVDTP failed"); return false; }
-    if (!upnp->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) { pushQ(authQ, SRC_UPNP, d, n); })) { dbgf("subscribe UPNP failed"); return false; }
-  }
-  if (!txChar->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) { onUart(d, n); })) { dbgf("subscribe UART failed"); return false; }
+  if (!txChar->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) { onUart(d, n); })) { dbgf("subscribe UART failed"); logDrop(); return false; }
   dbgf("link up, %s mode", cryptoMode ? "secure" : "plain");
   delay(300);
   return true;
@@ -895,6 +1040,7 @@ void drawHome() {
   T(4, 111, String("root@scooter:~$ ") + (blink() ? "_" : " "), C_FG, 2);
   T(4, 127, String("storage:") + fsName, C_DIM, 0);
   TR(236, 127, "v2.0", C_DIM, 0);
+  TR(236, 114, String("[T] theme: ") + THEMES[themeIdx].name, C_DIM, 0);
   cv.pushSprite(0, 0);
 }
 
@@ -923,6 +1069,9 @@ void drawScan() {
   cv.pushSprite(0, 0);
 }
 
+// Battery temperature colour: cold (<0) cyan, normal green, warm amber, hot red.
+uint16_t tempColor(int c) { return c < 0 ? C_CYAN : (c <= 45 ? C_FG : (c <= 55 ? C_AMBER : C_RED)); }
+
 void drawRide() {
   bg();
   const char* st = scooterConnected ? (sessionActive ? "SECURE" : "LINK") : "NO LINK";
@@ -943,23 +1092,181 @@ void drawRide() {
   segBar(40, 87, 150, 9, tel.batt >= 0 ? b : 0, bc);
   TR(236, 83, tel.batt >= 0 ? String(b) + "%" : String("--"), bc, 2);
 
-  // stats
+  // scooter range + battery temperature
   char buf[24];
-  snprintf(buf, sizeof(buf), "ride %.2fkm", tel.rideKm);
-  T(4, 100, buf, C_FG, 2);
-  if (tel.totalKm >= 0) snprintf(buf, sizeof(buf), "odo %.0fkm", tel.totalKm); else snprintf(buf, sizeof(buf), "odo --");
-  TR(236, 100, buf, C_DIM, 2);
+  uint32_t now = millis();
+  float estKm, estWk;
+  if (bs.rangeFresh(now)) {
+    snprintf(buf, sizeof(buf), "rng %.1fkm", bs.rangeKm);
+    T(4, 100, buf, bs.rangeKm < 5 ? C_RED : (bs.rangeKm < 10 ? C_AMBER : C_FG), 2);
+  } else if (bs.estimate(tel.rideKm, estKm, estWk)) {
+    snprintf(buf, sizeof(buf), "rng ~%.1fkm", estKm);
+    T(4, 100, buf, C_DIM, 2);
+  } else {
+    T(4, 100, "rng --", C_DIM, 2);
+  }
+  if (bs.liveFresh(now)) {
+    int t = bs.live.tmax();
+    snprintf(buf, sizeof(buf), "bat %dC", t);
+    TR(236, 100, buf, tempColor(t), 2);
+  } else {
+    TR(236, 100, "bat --", C_DIM, 2);
+  }
 
-  // footer: imu + rec
+  // footer: ride distance + rec / keys
   cv.drawFastHLine(0, 117, cv.width(), C_FAINT);
-  snprintf(buf, sizeof(buf), "imu %.2fg", lastAccG);
+  snprintf(buf, sizeof(buf), "ride %.2fkm", tel.rideKm);
   T(4, 118, buf, C_DIM, 2);
   if (recording) {
     snprintf(buf, sizeof(buf), "%s REC %lu", blink(400) ? "*" : " ", (unsigned long)samples);
     TR(236, 118, buf, C_RED, 2);
   } else {
-    TR(236, 122, "[R]ec  [Q]uit", C_DIM, 0);
+    TR(236, 122, "[R]ec [I]nfo [Q]uit", C_DIM, 0);
   }
+  cv.pushSprite(0, 0);
+}
+
+// ---------------- Battery info pages ----------------
+int infoY = 21;
+void infoRow(const char* k, const String& v, uint16_t col = C_FG) {
+  T(6, infoY, k, C_DIM, 2);
+  T(70, infoY, v, col, 2);
+  infoY += 17;
+}
+
+// page 1 = live, 2 = cells, 3 = pack (identity/health), 4 = this ride
+void drawBattInfo(int page) {
+  bg();
+  uint32_t now = millis();
+  bool fresh = bs.liveFresh(now);
+  const bat::Live& L = bs.live;
+  static const char* titles[] = {"", "battery :: live", "battery :: cells", "battery :: pack", "battery :: ride"};
+
+  String st;
+  uint16_t sc;
+  if (!scooterConnected) { st = "NO LINK"; sc = C_RED; }
+  else if (!fresh) { st = "no data"; sc = C_AMBER; }
+  else if (L.charging()) { st = "CHG"; sc = C_CYAN; }
+  else if (L.amps > 0.05f) { st = "DIS"; sc = C_FG; }
+  else if (L.amps < -0.05f) { st = "REGEN"; sc = C_CYAN; }
+  else { st = "IDLE"; sc = C_DIM; }
+  header(titles[page], st, sc);
+  infoY = 21;
+  auto col = [&](uint16_t c) { return fresh ? c : (uint16_t)C_DIM; };
+  char b[48];
+
+  if (page == 1) {
+    if (!L.ok) {
+      infoRow("status", scooterConnected ? "waiting for BMS..." : "not connected", C_AMBER);
+      snprintf(b, sizeof(b), "motor %lu  bms %lu", (unsigned long)rxMotorN, (unsigned long)rxBmsN);
+      infoRow("replies", b, C_DIM);
+      snprintf(b, sizeof(b), "%lu rejected", (unsigned long)rxBmsBad);
+      infoRow("bad", b, rxBmsBad ? C_AMBER : C_DIM);
+    } else {
+      snprintf(b, sizeof(b), "%u%%  %umAh", (unsigned)L.pct, (unsigned)L.capMah);
+      infoRow("charge", b, col(L.pct > 50 ? C_FG : (L.pct > 20 ? C_AMBER : C_RED)));
+      if (bs.cells.ok) snprintf(b, sizeof(b), "%.2fV  %.2fV/cell", L.volts, bs.perCellV());
+      else snprintf(b, sizeof(b), "%.2fV", L.volts);
+      infoRow("volts", b, col(C_FG));
+      snprintf(b, sizeof(b), "%+.2fA  %.0fW", L.amps, bs.watts());
+      infoRow("current", b, col(L.amps < -0.05f ? C_CYAN : C_FG));
+      snprintf(b, sizeof(b), "%d/%dC", L.t1, L.t2);
+      if (bs.escTemp > -100) {
+        char e[20];
+        snprintf(e, sizeof(e), "  esc %.0fC", bs.escTemp);
+        strncat(b, e, sizeof(b) - strlen(b) - 1);
+      }
+      infoRow("temp", b, col(tempColor(L.tmax())));
+      float km, wk;
+      bool eok = bs.estimate(tel.rideKm, km, wk);
+      if (bs.rangeFresh(now)) snprintf(b, sizeof(b), "%.1fkm", bs.rangeKm);
+      else snprintf(b, sizeof(b), "--");
+      if (eok) {
+        char e[24];
+        snprintf(e, sizeof(e), "  est %.1fkm", km);
+        strncat(b, e, sizeof(b) - strlen(b) - 1);
+      }
+      infoRow("range", b, C_FG);
+      if (eok) snprintf(b, sizeof(b), "%.1fWh/km  %dmAh", wk, bs.usedMah());
+      else if (bs.haveBase) snprintf(b, sizeof(b), "%dmAh (est needs 0.4km)", bs.usedMah());
+      else snprintf(b, sizeof(b), "--");
+      infoRow("use", b, eok ? C_FG : C_DIM);
+    }
+  } else if (page == 2) {
+    const bat::Cells& C = bs.cells;
+    bool cf = scooterConnected && now - bs.cellsMs < 15000;
+    if (!C.ok) {
+      infoRow("cells", scooterConnected ? "waiting for BMS..." : "not connected", C_AMBER);
+    } else {
+      int n = C.n, rows = (n + 1) / 2;
+      bool big = rows > 5;
+      int pitch = big ? 11 : 17, font = big ? 0 : 2;
+      for (int i = 0; i < n; i++) {
+        int x = 6 + (i / rows) * 120, y = 21 + (i % rows) * pitch;
+        uint16_t cc = i == C.minIdx ? C_CYAN : (i == C.maxIdx ? C_AMBER : C_FG);
+        bool bal = (L.balance >> i) & 1;
+        snprintf(b, sizeof(b), "%2d %.3fV%s", i + 1, C.mv[i] / 1000.0f, bal ? "*" : "");
+        T(x, y, b, cf ? cc : C_DIM, font);
+      }
+      snprintf(b, sizeof(b), "d%dmV  lo %.3f  hi %.3f", C.deltaMv(), C.minMv / 1000.0f, C.maxMv / 1000.0f);
+      T(6, 107, b, C_DIM, 2);
+    }
+  } else if (page == 3) {
+    const bat::Info& I = bs.info;
+    if (!I.ok) {
+      infoRow("pack", scooterConnected ? "reading BMS info..." : "not connected", C_AMBER);
+    } else {
+      infoRow("serial", I.serial[0] ? I.serial : "--");
+      char v[8];
+      bat::versionStr(I.version, v, sizeof(v));
+      if (bs.date.ok && bs.date.raw) snprintf(b, sizeof(b), "fw %s  %04d-%02d-%02d", v, bs.date.year(), bs.date.month(), bs.date.day());
+      else snprintf(b, sizeof(b), "fw %s", v);
+      infoRow("bms", b);
+      snprintf(b, sizeof(b), "%u / %u mAh", (unsigned)I.realMah, (unsigned)I.designMah);
+      infoRow("capacity", b);
+      int wear = 0;
+      bool hw = bs.wearPct(wear);
+      if (hw && L.ok) snprintf(b, sizeof(b), "bms %u%%  wear %d%%", (unsigned)L.health, wear);
+      else if (hw) snprintf(b, sizeof(b), "wear %d%%", wear);
+      else snprintf(b, sizeof(b), "--");
+      infoRow("health", b, hw && wear > 40 ? C_RED : (hw && wear > 20 ? C_AMBER : C_FG));
+      snprintf(b, sizeof(b), "%u cycles  %u chg", (unsigned)I.cycles, (unsigned)I.charges);
+      infoRow("cycles", b);
+      snprintf(b, sizeof(b), "max %.1fV %.0fA/%.0fA", I.maxV / 100.0f, I.maxDis / 100.0f, I.maxChg / 100.0f);
+      infoRow("limits", b, C_DIM);
+    }
+  } else {
+    if (!L.ok) {
+      infoRow("status", scooterConnected ? "waiting for BMS..." : "not connected", C_AMBER);
+    } else {
+      String fl;
+      if (L.status & bat::ST_CHARGING) fl += "CHG ";
+      if (L.status & bat::ST_OVERVOLT) fl += "OVERV ";
+      if (L.status & bat::ST_OVERHEAT) fl += "HOT ";
+      if (bs.date.ok && bs.date.anyError()) {
+        fl += "E:";
+        for (int i = 0; i < 6; i++) { snprintf(b, sizeof(b), "%02X", bs.date.err[i]); fl += b; }
+      }
+      bool bad = (L.status & (bat::ST_OVERVOLT | bat::ST_OVERHEAT)) || (bs.date.ok && bs.date.anyError());
+      snprintf(b, sizeof(b), "0x%04X %s", (unsigned)L.status, fl.length() ? fl.c_str() : "ok");
+      infoRow("status", b, bad ? C_RED : col(C_FG));
+      snprintf(b, sizeof(b), "%.1fA  %.0fW", bs.peakAmps, bs.peakWatts);
+      infoRow("peak", b);
+      snprintf(b, sizeof(b), "now %dC  max %dC", L.tmax(), bs.maxTemp);
+      infoRow("temp", b, tempColor(bs.maxTemp));
+      if (bs.minCellMv) snprintf(b, sizeof(b), "min %.2fV  cell %.3fV", bs.minVolts, bs.minCellMv / 1000.0f);
+      else snprintf(b, sizeof(b), "min %.2fV", bs.minVolts);
+      infoRow("volts", b);
+      snprintf(b, sizeof(b), "out %.*fWh  regen %.1fWh", bs.whOut < 100 ? 1 : 0, bs.whOut, bs.whRegen);
+      infoRow("energy", b);
+      if (tel.totalKm >= 0) snprintf(b, sizeof(b), "ride %.2fkm  odo %.0fkm", tel.rideKm, tel.totalKm);
+      else snprintf(b, sizeof(b), "ride %.2fkm  odo --", tel.rideKm);
+      infoRow("trip", b);
+    }
+  }
+
+  snprintf(b, sizeof(b), "[I]next [,]prev %s [Q]back  p%d/%d", recording ? "[R]stop" : "[R]ec", page, INFO_PAGES);
+  footer(b);
   cv.pushSprite(0, 0);
 }
 
@@ -996,19 +1303,38 @@ void imuTick() {
   auto d = M5.Imu.getImuData();
   lastAccG = sqrtf(d.accel.x * d.accel.x + d.accel.y * d.accel.y + d.accel.z * d.accel.z);
   if (!recording) return;
-  logFile.printf("%lu,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%d\n", (unsigned long)millis(),
+  logFile.printf("%lu,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%d", (unsigned long)millis(),
                  d.accel.x, d.accel.y, d.accel.z, d.gyro.x, d.gyro.y, d.gyro.z, tel.kmh, tel.batt);
+  if (bs.liveFresh(millis())) logFile.printf(",%.2f,%.2f,%d,%d\n", bs.live.volts, bs.live.amps, bs.live.t1, bs.live.t2);
+  else logFile.print(",,,,\n");
   samples++;
   if (millis() - lastFlush > 1000) { logFile.flush(); lastFlush = millis(); }
 }
 
+// Poll schedule (every 150 ms): motor info most of the time, BMS live data every 8th tick,
+// and one "slow" read per 8 ticks cycling through cells / scooter range / pack info / date.
 void pollTick_() {
-  if (!scooterConnected || millis() - lastPoll < 250) return;
+  if (!scooterConnected || millis() - lastPoll < 150) return;
   lastPoll = millis();
+  static uint8_t seq = 0, slow = 0;
+  seq++;
+  uint8_t slot = seq & 7;
+  if (slot == 1) { sendRead(bat::ADDR_BMS_TX, bat::REG_LIVE, bat::LEN_LIVE); return; }
+  if (slot == 3) {
+    for (int tries = 0; tries < 4; tries++) {
+      uint8_t k = (slow++) & 3;
+      if (k == 0) { sendRead(bat::ADDR_BMS_TX, bat::REG_CELLS, bat::LEN_CELLS); return; }
+      if (k == 1) { sendRead(bat::ADDR_ESC_TX, bat::REG_ESC_RANGE, bat::LEN_ESC_RANGE); return; }
+      if (k == 2 && !bs.info.ok) { sendRead(bat::ADDR_BMS_TX, bat::REG_INFO, bat::LEN_INFO); return; }
+      if (k == 3 && !bs.date.ok) { sendRead(bat::ADDR_BMS_TX, bat::REG_DATE, bat::LEN_DATE); return; }
+    }
+    return;
+  }
   sendMotorInfoReq();
 }
 
 void goHome() {
+  infoPage = 0;
   if (state == ST_RIDE) {
     stopRecording();
     if (client && scooterConnected) client->disconnect();
@@ -1025,11 +1351,13 @@ void setup() {
   M5Cardputer.begin(cfg, true);
   M5Cardputer.Display.setRotation(1);
   cv.createSprite(M5Cardputer.Display.width(), M5Cardputer.Display.height());
+  loadTheme();
 
   authQ = xQueueCreate(16, sizeof(Notif));
   frameQ = xQueueCreate(8, sizeof(Notif));
   bool storOk = initStorage();
   NimBLEDevice::init(APP_NAME);
+  NimBLEDevice::setCustomGapHandler(gapTap);
   {  // fake-but-honest boot log
     String lines[5] = {String("[ OK ] ") + APP_NAME + " v2.0",
                        String(storOk ? "[ OK ] storage :: " : "[FAIL] storage :: ") + fsName,
@@ -1061,6 +1389,7 @@ void loop() {
     case ST_HOME:
       { static uint32_t lh = 0; if (millis() - lh > 250) { lh = millis(); drawHome(); } }
       if (k == 's') { showAll = false; scanScooters(); state = ST_SCAN; drawScan(); }
+      else if (k == 't') { cycleTheme(); drawHome(); }
       else if (k == 'w' && fsys) { startWifiExport(); state = ST_EXPORT_WIFI; drawExport(true); }
       else if (k == 'b' && fsys) { startBleExport(); state = ST_EXPORT_BLE; drawExport(false); }
       break;
@@ -1075,6 +1404,9 @@ void loop() {
       else if (k == '\n' && !devs.empty()) {
         if (connectScooter(devs[sel].addr)) {
           tel = Telemetry();
+          bs = bat::State();
+          infoPage = 0;
+          rxMotorN = rxBmsN = rxBmsBad = 0;
           spdCount = 0;
           state = ST_RIDE;
           break;
@@ -1085,7 +1417,14 @@ void loop() {
 
     case ST_RIDE:
       if (k == 'r') { recording ? stopRecording() : startRecording(); }
-      else if (k == 'q') { goHome(); break; }
+      else if (k == 't') cycleTheme();
+      else if (k == 'i') infoPage = (infoPage + 1) % (INFO_PAGES + 1);
+      else if (k == '/' && infoPage) infoPage = infoPage % INFO_PAGES + 1;
+      else if (k == ',' && infoPage) infoPage = infoPage == 1 ? INFO_PAGES : infoPage - 1;
+      else if (k == 'q') {
+        if (infoPage) infoPage = 0;
+        else { goHome(); break; }
+      }
       processFrames();
       imuTick();
       pollTick_();
@@ -1104,7 +1443,7 @@ void loop() {
         static uint32_t lastTry = 0;
         if (millis() - lastTry > 4000) { lastTry = millis(); connectScooter(scooterAddr); }
       }
-      if (millis() - lastDraw > 100) { lastDraw = millis(); drawRide(); }
+      if (millis() - lastDraw > 100) { lastDraw = millis(); if (infoPage) drawBattInfo(infoPage); else drawRide(); }
       break;
 
     case ST_EXPORT_WIFI:
