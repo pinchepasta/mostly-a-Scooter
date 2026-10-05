@@ -9,6 +9,8 @@
 //               F = forget saved pairing of selected scooter   Q = back
 //        Pair:  Q = cancel
 //        Ride:  R = start/stop recording   I = battery info pages   T = theme   Q = disconnect & home
+//               L = motor lock/unlock   H = lights on/off   S = settings (motor brake level)
+//        Settings: L = lock   H = lights   , / . = motor brake weaker/stronger   Q = back
 //        Info:  I or / = next page   , = previous page   R = record   Q = back to ride
 //        Export: Q = back
 
@@ -65,7 +67,7 @@ static NimBLEUUID EXP_CMD("6e4f0002-1c2d-4a57-9b11-0a6b5c0d0001");   // write: L
 static NimBLEUUID EXP_DATA("6e4f0003-1c2d-4a57-9b11-0a6b5c0d0001");  // notify: stream, ends with "\n#EOF\n"
 
 // ---------------- Globals ----------------
-enum State { ST_HOME, ST_SCAN, ST_RIDE, ST_EXPORT_WIFI, ST_EXPORT_BLE };
+enum State { ST_HOME, ST_SCAN, ST_RIDE, ST_SETTINGS, ST_EXPORT_WIFI, ST_EXPORT_BLE };
 State state = ST_HOME;
 
 M5Canvas cv(&M5Cardputer.Display);
@@ -491,6 +493,88 @@ void sendRead(uint8_t addr, uint8_t reg, uint8_t len) {
 }
 
 void sendMotorInfoReq() { sendRead(bat::ADDR_ESC_TX, REG_MOTOR_INFO, 0x20); }
+
+// ---------------- Scooter control (writes) ----------------
+// Xiaomi M365 / Pro / Pro 2 ESC registers (write = command 0x03 to device 0x20).
+constexpr uint8_t REG_LOCK = 0x70;        // write 0x0001 = lock motor
+constexpr uint8_t REG_UNLOCK = 0x71;      // write 0x0001 = unlock motor
+constexpr uint8_t REG_BRAKE_KERS = 0x7B;  // motor brake / energy recovery: 0 weak, 1 medium, 2 strong
+constexpr uint8_t REG_LIGHT = 0x7D;       // 0x0002 = lights on, 0x0000 = off
+const char* BRAKE_NAMES[3] = {"weak", "medium", "strong"};
+
+bool scooterLocked = false;  // last state we commanded (a power-cycled scooter comes back unlocked)
+bool lightsOn = false;       // last state we commanded
+int brakeLevel = 1;          // motor brake level, saved in prefs
+String ctlNote;              // one-line result of the last command, shown on screen
+uint32_t ctlNoteAt = 0;
+
+void setNote(const String& s) { ctlNote = s; ctlNoteAt = millis(); }
+
+// Write a 16-bit value to an ESC register.
+bool sendWrite16(uint8_t reg, uint16_t val) {
+  if (!scooterConnected || !rxChar) { setNote("no link"); return false; }
+  const uint8_t addr = bat::ADDR_ESC_TX;
+  uint8_t out[48];
+  size_t n;
+  if (sessionActive) {
+    const uint8_t req[6] = {4, addr, 0x03, reg, (uint8_t)(val & 0xFF), (uint8_t)(val >> 8)};
+    n = mi::encrypt_uart(keys.app, req, 6, 0, nullptr, out);
+    if (!n) { setNote("encrypt failed"); return false; }
+  } else {
+    uint8_t f[10] = {0x55, 0xAA, 0x04, addr, 0x03, reg, (uint8_t)(val & 0xFF), (uint8_t)(val >> 8), 0, 0};
+    uint16_t sum = 0;
+    for (int i = 2; i < 8; i++) sum += f[i];
+    sum ^= 0xFFFF;
+    f[8] = sum & 0xFF; f[9] = sum >> 8;
+    memcpy(out, f, 10);
+    n = 10;
+  }
+  for (size_t o = 0; o < n; o += 20) rxChar->writeValue(out + o, min((size_t)20, n - o), false);
+  return true;
+}
+
+// Motor lock. Refused while rolling so the scooter can't be locked mid-ride.
+void setLock(bool lock) {
+  if (lock && tel.kmh > 1.0f) { setNote("stop first (moving)"); return; }
+  if (sendWrite16(lock ? REG_LOCK : REG_UNLOCK, 1)) {
+    scooterLocked = lock;
+    setNote(lock ? "motor LOCKED" : "motor unlocked");
+  }
+}
+
+void setLights(bool on) {
+  if (sendWrite16(REG_LIGHT, on ? 2 : 0)) {
+    lightsOn = on;
+    setNote(on ? "lights ON" : "lights OFF");
+  }
+}
+
+void setBrake(int level, bool save = true) {
+  level = constrain(level, 0, 2);
+  if (sendWrite16(REG_BRAKE_KERS, level)) {
+    brakeLevel = level;
+    setNote(String("brake: ") + BRAKE_NAMES[level]);
+    if (save) {
+      prefs.begin("ui", false);
+      prefs.putUChar("brake", brakeLevel);
+      prefs.end();
+    }
+  }
+}
+
+void loadScooterSettings() {
+  prefs.begin("ui", true);
+  brakeLevel = constrain((int)prefs.getUChar("brake", 1), 0, 2);
+  prefs.end();
+}
+
+// Called once after a fresh connect: push the saved brake level, reset local lock/light state.
+void applySavedScooterSettings() {
+  scooterLocked = false;
+  lightsOn = false;
+  delay(150);
+  setBrake(brakeLevel, false);
+}
 
 // ---------------- Pairing UI ----------------
 const char* pairStatus = "";
@@ -1142,13 +1226,36 @@ void drawRide() {
   // footer: ride distance + rec / keys
   cv.drawFastHLine(0, 117, cv.width(), C_FAINT);
   snprintf(buf, sizeof(buf), "ride %.2fkm", tel.rideKm);
-  T(4, 118, buf, C_DIM, 2);
+  bool noteOn = ctlNote.length() && millis() - ctlNoteAt < 2500;
+  if (noteOn) T(4, 118, ctlNote, C_CYAN, 2);  // last lock / light / brake result
+  else T(4, 118, buf, C_DIM, 2);
   if (recording) {
     snprintf(buf, sizeof(buf), "%s REC %lu", blink(400) ? "*" : " ", (unsigned long)samples);
     TR(236, 118, buf, C_RED, 2);
   } else {
-    TR(236, 122, "[R]ec [I]nfo [Q]uit", C_DIM, 0);
+    TR(236, 122, "L H S R I Q", C_DIM, 0);
   }
+  // status badges (lock / lights) + last command result
+  if (scooterLocked) T(56, 66, "LOCKED", C_RED, 2);
+  else if (lightsOn) T(56, 66, "LIGHT", C_AMBER, 2);
+  cv.pushSprite(0, 0);
+}
+
+void drawSettings() {
+  bg();
+  header("settings", scooterConnected ? (sessionActive ? "SECURE" : "LINK") : "NO LINK",
+         scooterConnected ? C_FG : C_RED);
+  T(6, 24, "[L] motor lock", C_FG, 2);
+  TR(236, 24, scooterLocked ? "LOCKED" : "off", scooterLocked ? C_RED : C_DIM, 2);
+  T(6, 44, "[H] lights", C_FG, 2);
+  TR(236, 44, lightsOn ? "ON" : "off", lightsOn ? C_AMBER : C_DIM, 2);
+  T(6, 64, "[</>] motor brake", C_FG, 2);
+  char b[24];
+  snprintf(b, sizeof(b), "%s (%d/2)", BRAKE_NAMES[brakeLevel], brakeLevel);
+  TR(236, 64, b, C_CYAN, 2);
+  segBar(6, 86, 228, 8, (brakeLevel + 1) * 100 / 3, C_CYAN);
+  if (ctlNote.length() && millis() - ctlNoteAt < 3000) T(6, 102, "> " + ctlNote, C_AMBER, 2);
+  footer("L lock  H lights  , / . brake  Q back");
   cv.pushSprite(0, 0);
 }
 
@@ -1378,6 +1485,7 @@ void setup() {
   M5Cardputer.Display.setRotation(1);
   cv.createSprite(M5Cardputer.Display.width(), M5Cardputer.Display.height());
   loadTheme();
+  loadScooterSettings();
 
   authQ = xQueueCreate(16, sizeof(Notif));
   frameQ = xQueueCreate(8, sizeof(Notif));
@@ -1434,6 +1542,7 @@ void loop() {
           infoPage = 0;
           rxMotorN = rxBmsN = rxBmsBad = 0;
           spdCount = 0;
+          applySavedScooterSettings();
           state = ST_RIDE;
           break;
         }
@@ -1444,6 +1553,9 @@ void loop() {
     case ST_RIDE:
       if (k == 'r') { recording ? stopRecording() : startRecording(); }
       else if (k == 't') cycleTheme();
+      else if (k == 'l' && !infoPage) setLock(!scooterLocked);
+      else if (k == 'h' && !infoPage) setLights(!lightsOn);
+      else if (k == 's') { infoPage = 0; state = ST_SETTINGS; drawSettings(); break; }
       else if (k == 'i') infoPage = (infoPage + 1) % (INFO_PAGES + 1);
       else if (k == '/' && infoPage) infoPage = infoPage % INFO_PAGES + 1;
       else if (k == ',' && infoPage) infoPage = infoPage == 1 ? INFO_PAGES : infoPage - 1;
@@ -1470,6 +1582,19 @@ void loop() {
         if (millis() - lastTry > 4000) { lastTry = millis(); connectScooter(scooterAddr); }
       }
       if (millis() - lastDraw > 100) { lastDraw = millis(); if (infoPage) drawBattInfo(infoPage); else drawRide(); }
+      break;
+
+    case ST_SETTINGS:
+      if (k == 'l') setLock(!scooterLocked);
+      else if (k == 'h') setLights(!lightsOn);
+      else if (k == ',' ) setBrake(brakeLevel - 1);
+      else if (k == '.' ) setBrake(brakeLevel + 1);
+      else if (k == 'q') { state = ST_RIDE; break; }
+      // keep telemetry flowing so the link and ride stats stay alive while in settings
+      processFrames();
+      imuTick();
+      pollTick_();
+      if (millis() - lastDraw > 100) { lastDraw = millis(); drawSettings(); }
       break;
 
     case ST_EXPORT_WIFI:
